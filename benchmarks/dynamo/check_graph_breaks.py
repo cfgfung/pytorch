@@ -2,6 +2,7 @@ import argparse
 import os
 import sys
 import textwrap
+from typing import Any
 
 import pandas as pd
 
@@ -10,54 +11,64 @@ import pandas as pd
 
 flaky_models = {
     "yolov3",
-    "gluon_inception_v3",
     "detectron2_maskrcnn_r_101_c4",
     "XGLMForCausalLM",  # discovered in https://github.com/pytorch/pytorch/pull/128148
+    "detectron2_fcos_r_50_fpn",
 }
 
 
-def get_field(csv, model_name: str, field: str):
+def get_field(csv: pd.DataFrame, model_name: str, field: str) -> Any | None:
     try:
         return csv.loc[csv["name"] == model_name][field].item()
     except Exception:
         return None
 
 
-def check_graph_breaks(actual_csv, expected_csv, expected_filename):
-    failed = []
-    improved = []
+def check_graph_breaks(
+    actual_csv: pd.DataFrame, expected_csv: pd.DataFrame, expected_filename: str
+) -> tuple[list[str], str]:
+    failed: list[str] = []
+    improved: list[str] = []
 
     if "rocm" in expected_filename:
         flaky_models.update(
             {
                 "alexnet",
-                "cait_m36_384",
                 "demucs",
                 "densenet121",
                 "detectron2_fcos_r_50_fpn",
                 "doctr_det_predictor",
                 "doctr_reco_predictor",
-                "hf_BigBird",
-                "hf_Longformer",
-                "hf_Reformer",
-                "hf_Roberta_base",
-                "hf_T5",
-                "hf_T5_base",
                 "levit_128",
                 "llava",
                 "microbench_unbacked_tolist_sum",
+                "resnet50",
+                "resnet152",
                 "sam",
                 "sam_fast",
                 "stable_diffusion_text_encoder",
                 "stable_diffusion_unet",
                 "timm_efficientdet",
-                "timm_nfnet",
                 "torchrec_dlrm",
                 "vgg16",
+                # LLM
+                "meta-llama/Llama-3.2-1B",
+                "google/gemma-2-2b",
+                "google/gemma-3-4b-it",
+                "openai/whisper-tiny",
+                "Qwen/Qwen3-0.6B",
+                "mistralai/Mistral-7B-Instruct-v0.3",
+                "openai/gpt-oss-20b",
+                # Discovered after gfx950 CI enablement and rocm 7.2
+                "mobilenet_v3_large",
+                "mnasnet1_0",
             }
         )
 
     for model in actual_csv["name"]:
+        num_graphs = get_field(actual_csv, model, "unique_graphs")
+        dynamo_called = num_graphs is not None and int(num_graphs) != 0
+
         graph_breaks = get_field(actual_csv, model, "graph_breaks")
         expected_graph_breaks = get_field(expected_csv, model, "graph_breaks")
         flaky = model in flaky_models
@@ -65,6 +76,9 @@ def check_graph_breaks(actual_csv, expected_csv, expected_filename):
         if expected_graph_breaks is None:
             status = "MISSING:"
             improved.append(model)
+        elif not dynamo_called:
+            print(f"{model:34}  EAGER_FAILED")
+            continue
         elif graph_breaks == expected_graph_breaks:
             status = "PASS_BUT_FLAKY" if flaky else "PASS"
             print(f"{model:34}  {status}")
@@ -91,7 +105,7 @@ def check_graph_breaks(actual_csv, expected_csv, expected_filename):
             msg += textwrap.dedent(
                 f"""
             Error: {len(failed)} models have new dynamo graph breaks:
-                {' '.join(failed)}
+                {" ".join(failed)}
 
             """
             )
@@ -99,7 +113,7 @@ def check_graph_breaks(actual_csv, expected_csv, expected_filename):
             msg += textwrap.dedent(
                 f"""
             Improvement: {len(improved)} models have fixed dynamo graph breaks:
-                {' '.join(improved)}
+                {" ".join(improved)}
 
             """
             )

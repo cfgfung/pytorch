@@ -7,7 +7,7 @@ import os
 import re
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Callable, Dict, List, Optional, TYPE_CHECKING, Union
+from typing import TYPE_CHECKING
 
 from torch._inductor import config
 from torch._inductor.utils import get_benchmark_name
@@ -16,6 +16,9 @@ from torch.utils._ordered_set import OrderedSet
 
 # Prevent circular import
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from torch._inductor.runtime.triton_compat import Config
     from torch._inductor.scheduler import BaseSchedulerNode
 
 # counter for tracking how many kernels have been generated
@@ -50,6 +53,14 @@ num_comprehensive_padding = 0
 num_matches_for_scatter_upon_const_tensor = 0
 
 num_loop_reordering = 0
+num_auto_chunking: int = 0
+
+# counter for parallel reduction.
+parallel_reduction_count = 0
+
+codegen_mix_order_reduction: int = 0
+rejected_mix_order_reduction_fusion: int = 0
+codegen_nested_reduction: int = 0
 
 
 # reset all counters
@@ -63,6 +74,11 @@ def reset() -> None:
     global num_comprehensive_padding
     global num_matches_for_scatter_upon_const_tensor
     global num_loop_reordering
+    global parallel_reduction_count
+    global codegen_mix_order_reduction
+    global rejected_mix_order_reduction_fusion
+    global codegen_nested_reduction
+    global num_auto_chunking
 
     generated_kernel_count = 0
     generated_cpp_vec_kernel_count = 0
@@ -75,6 +91,11 @@ def reset() -> None:
     num_comprehensive_padding = 0
     num_matches_for_scatter_upon_const_tensor = 0
     num_loop_reordering = 0
+    parallel_reduction_count = 0
+    codegen_mix_order_reduction = 0
+    rejected_mix_order_reduction_fusion = 0
+    codegen_nested_reduction = 0
+    num_auto_chunking = 0
 
 
 @dataclass
@@ -92,7 +113,7 @@ class CachedMetricsDeltas:
     num_matches_for_scatter_upon_const_tensor: int
 
 
-def get_metric_fields() -> List[str]:
+def get_metric_fields() -> list[str]:
     return [field.name for field in dataclasses.fields(CachedMetricsDeltas)]
 
 
@@ -131,24 +152,23 @@ class MetricTable:
 
     num_rows_added: int = 0
 
-    def add_row(
-        self, row_fn: Callable[[], Dict[str, Optional[Union[str, float]]]]
-    ) -> None:
+    def add_row(self, row_fn: Callable[[], dict[str, str | float | None]]) -> None:
         if self.table_name not in enabled_metric_tables():
             return
 
         row_dict = row_fn()
-        assert len(self.column_names) == len(
-            row_dict
-        ), f"{len(self.column_names)} v.s. {len(row_dict)}"
-        assert OrderedSet(self.column_names) == OrderedSet(
-            row_dict.keys()
-        ), f"{OrderedSet(self.column_names)} v.s. {OrderedSet(row_dict.keys())}"
+        if len(self.column_names) != len(row_dict):
+            raise AssertionError(f"{len(self.column_names)} v.s. {len(row_dict)}")
+        if OrderedSet(self.column_names) != OrderedSet(row_dict.keys()):
+            raise AssertionError(
+                f"{OrderedSet(self.column_names)} v.s. {OrderedSet(row_dict.keys())}"
+            )
 
-        row = [
-            get_benchmark_name(),
-        ]
-        row += [row_dict[column_name] for column_name in self.column_names]
+        bn = get_benchmark_name()
+        # assert bn is not None
+        row = [bn] + [row_dict[column_name] for column_name in self.column_names]
+        if not all(isinstance(i, (str, float, type(None))) for i in row):
+            raise AssertionError("expected all row values to be str, float, or None")
         self._write_row(row)
 
     def output_filename(self) -> str:
@@ -160,7 +180,7 @@ class MetricTable:
             writer = csv.writer(fd, lineterminator="\n")
             writer.writerow(["model_name"] + self.column_names)
 
-    def _write_row(self, row: List[str]) -> None:
+    def _write_row(self, row: list[str | float | None]) -> None:
         filename = self.output_filename()
         if self.num_rows_added == 0 and not os.path.exists(filename):
             self.write_header()
@@ -181,7 +201,7 @@ class MetricTable:
             writer.writerow(row)
 
     @staticmethod
-    def register_table(name: str, column_names: List[str]) -> None:
+    def register_table(name: str, column_names: list[str]) -> None:
         table = MetricTable(name, column_names)
         REGISTERED_METRIC_TABLES[name] = table
 
@@ -293,22 +313,22 @@ def _parse_kernel_line_of_code(proper_kernel_fn_code: str) -> int:
     return len(proper_kernel_fn_code.splitlines())
 
 
-def _parse_size_hints(kernel_module_code: str, kernel_category: str) -> Optional[str]:
+def _parse_size_hints(kernel_module_code: str, kernel_category: str) -> str | None:
     if kernel_category == "foreach":
         # foreach kernel does not have size_hints
         return None
     m = re.search(r"size_hints=(\[[0-9, ]*\]),", kernel_module_code)
-    assert m, "size_hints missing!"
+    if not m:
+        raise AssertionError("size_hints missing!")
     return m.group(1)
 
 
-def _parse_reduction_hint(
-    kernel_category: str, kernel_module_code: str
-) -> Optional[str]:
+def _parse_reduction_hint(kernel_category: str, kernel_module_code: str) -> str | None:
     if kernel_category not in ("reduction", "persistent_reduction"):
         return None
     m = re.search(r"reduction_hint=ReductionHint\.(\w*),", kernel_module_code)
-    assert m, "reduction_hint not found in kernel source code!"
+    if not m:
+        raise AssertionError("reduction_hint not found in kernel source code!")
     return m.group(1)
 
 
@@ -318,7 +338,10 @@ def _count_pattern(proper_kernel_fn_code: str, pattern: str) -> int:
 
 def _count_args(proper_kernel_fn_code: str) -> int:
     def_line = proper_kernel_fn_code.splitlines()[0]
-    assert def_line.startswith("def ")
+    if not def_line.startswith("def "):
+        raise AssertionError(
+            f"expected def line to start with 'def ', got {def_line!r}"
+        )
     start_idx = def_line.index("(")
     end_idx = def_line.index("):")
     decl_csv = def_line[start_idx + 1 : end_idx]
@@ -334,7 +357,7 @@ def _parse_proper_kernel_fn_code(kernel_fn_code: str) -> str:
     return kernel_fn_code[start_pos:]
 
 
-def _parse_numel(proper_kernel_fn_code: str, numel_arg_name: str) -> Optional[int]:
+def _parse_numel(proper_kernel_fn_code: str, numel_arg_name: str) -> int | None:
     m = re.search(f"{numel_arg_name} = ([\\d]+)", proper_kernel_fn_code)
     if m:
         return int(m.group(1))
@@ -344,7 +367,7 @@ def _parse_numel(proper_kernel_fn_code: str, numel_arg_name: str) -> Optional[in
 
 def _parse_kernel_args_num_gb(
     kernel_fn_code: str, kernel_category: str
-) -> Optional[float]:
+) -> float | None:
     """
     inductor meta looks like:
         inductor_meta={... 'mutated_arg_names': [], 'no_x_dim': False, 'kernel_num_gb': 2.0},
@@ -367,7 +390,7 @@ def log_kernel_metadata(
     kernel_name: str, kernel_path: str, kernel_module_code: str
 ) -> None:
     """
-    An utility to log kernel metadata. We may parse metadata from kernel source code here.
+    A utility to log kernel metadata. We may parse metadata from kernel source code here.
 
     It's fine to parse the generated kernel code here since the logging is
     disabled by default. It would hurt compilation time.
@@ -428,14 +451,13 @@ def enabled_metric_tables() -> OrderedSet[str]:
 
 @lru_cache
 def enabled_metric_tables_impl(config_str: str) -> OrderedSet[str]:
-    enabled = OrderedSet[str]()
+    enabled: OrderedSet[str] = OrderedSet()
     for name in config_str.split(","):
         name = name.strip()
         if not name:
             continue
-        assert (
-            name in REGISTERED_METRIC_TABLES
-        ), f"Metric table name {name} is not registered"
+        if name not in REGISTERED_METRIC_TABLES:
+            raise AssertionError(f"Metric table name {name} is not registered")
         enabled.add(name)
     return enabled
 
@@ -445,5 +467,30 @@ def is_metric_table_enabled(name: str) -> bool:
 
 
 def get_metric_table(name: str) -> MetricTable:
-    assert name in REGISTERED_METRIC_TABLES, f"Metric table {name} is not defined"
+    if name not in REGISTERED_METRIC_TABLES:
+        raise AssertionError(f"Metric table {name} is not defined")
     return REGISTERED_METRIC_TABLES[name]
+
+
+MetricTable.register_table(
+    "kernel_autotune",
+    [
+        "kernel_path",
+        "kernel_name",
+        "triton_config",
+        "latency_ms",
+    ],
+)
+
+
+def log_kernel_autotune_result(
+    kernel_path: str, kernel_name: str, config: Config, latency: float
+) -> None:
+    get_metric_table("kernel_autotune").add_row(
+        lambda: {
+            "kernel_path": kernel_path,
+            "kernel_name": kernel_name,
+            "triton_config": str(config),
+            "latency_ms": latency,
+        }
+    )

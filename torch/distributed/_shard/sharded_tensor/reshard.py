@@ -31,7 +31,7 @@ def get_idx_from_placements(placements, current_rank) -> int:
         current_rank (int): number of current device.
 
     Returns:
-        A int which contains the position of current device in the placement list.
+        An int which contains the position of current device in the placement list.
     """
     for idx, placement in enumerate(placements):  # type: ignore[attr-defined]
         if current_rank == placement.rank():  # type: ignore[union-attr]
@@ -219,9 +219,7 @@ def reshard_local_shard(
         output_tensor_size = list(st_size)
         output_tensor_size[current_sharding_dim] = sharded_dim_size
         output_tensor_size[reshard_dim] = input_split_sizes[current_rank]
-        output_tensor_list[
-            placement.rank()
-        ] = torch.empty(  # type: ignore[union-attr, index]
+        output_tensor_list[placement.rank()] = torch.empty(  # type: ignore[union-attr, index]
             output_tensor_size, device=local_tensor.device, dtype=local_tensor.dtype
         )
         indices.append(placement.rank())  # type: ignore[union-attr, index, arg-type]

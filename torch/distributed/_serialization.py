@@ -1,14 +1,14 @@
 import pickle
 from dataclasses import dataclass
 from io import BufferedIOBase
-from typing import Any, Dict, List, Tuple
+from typing import Any
 
 import torch
 import torch._weights_only_unpickler as _weights_only_unpickler
 from torch.serialization import _load, _save, DEFAULT_PROTOCOL, MAP_LOCATION
 
 
-__all__: List[str] = []
+__all__: list[str] = []
 
 
 @dataclass
@@ -23,7 +23,7 @@ _weights_only_unpickler._add_safe_globals([_Entry])
 
 class _PseudoZipFile:
     def __init__(self) -> None:
-        self.records: Dict[str, Tuple[object, int]] = {}
+        self.records: dict[str, tuple[object, int]] = {}
 
     def write_record(self, key: str, data: object, length: int) -> None:
         self.records[key] = (data, length)
@@ -41,7 +41,7 @@ class _PseudoZipFile:
 
         pickle.dump(entries, f, protocol=DEFAULT_PROTOCOL)
 
-        for key, (data, length) in self.records.items():
+        for data, _ in self.records.values():
             if isinstance(data, bytes):
                 f.write(data)
             elif isinstance(data, str):
@@ -57,10 +57,13 @@ class _PseudoZipFile:
         for entry in entries:
             data = f.read(entry.length)
             if entry.is_storage:
-                storage = torch.frombuffer(
-                    data,
-                    dtype=torch.uint8,
-                ).untyped_storage()
+                if entry.length == 0:
+                    storage = torch.UntypedStorage(0)
+                else:
+                    storage = torch.frombuffer(
+                        data,
+                        dtype=torch.uint8,
+                    ).untyped_storage()
 
                 self.records[entry.key] = (
                     storage,
@@ -97,7 +100,7 @@ def _streaming_save(
     This behaves similarly to :func:`torch.save` with a few notable differences:
 
     * A non-seekable file like object can be used when loading.
-    * No forwards/backwards compatiblity is provided for the serialization
+    * No forwards/backwards compatibility is provided for the serialization
       format. This is only intended to be used with a single version of PyTorch
       with transient storage (i.e. sockets or temp files).
     * mmap is not supported
@@ -142,7 +145,7 @@ def _streaming_load(
         if pickle_module is None:
             pickle_module = pickle
 
-    if "encoding" not in pickle_load_args.keys():
+    if "encoding" not in pickle_load_args:
         pickle_load_args["encoding"] = "utf-8"
 
     zip_file = _PseudoZipFile()

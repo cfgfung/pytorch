@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from ..common import DeviceOpOverrides, register_device_op_overrides
+from ..common import (
+    DeviceOpOverrides,
+    register_device_op_overrides,
+    TritonScratchWorkspace,
+)
 
 
 class XPUDeviceOpOverrides(DeviceOpOverrides):
@@ -15,6 +19,9 @@ class XPUDeviceOpOverrides(DeviceOpOverrides):
 
     def device_guard(self, device_idx: int) -> str:
         return f"torch.xpu._DeviceGuard({device_idx})"
+
+    def current_stream(self) -> str:
+        return "torch.xpu.current_stream()"
 
     def cpp_device_guard(self) -> str:
         return "at::DeviceGuard"
@@ -38,25 +45,7 @@ class XPUDeviceOpOverrides(DeviceOpOverrides):
         return source_codes
 
     def kernel_driver(self) -> str:
-        source_codes = """
-            namespace {
-
-            struct Grid {
-                Grid(uint32_t x, uint32_t y, uint32_t z)
-                  : grid_x(x), grid_y(y), grid_z(z) {}
-                uint32_t grid_x;
-                uint32_t grid_y;
-                uint32_t grid_z;
-
-                bool is_non_zero() {
-                    return grid_x > 0 && grid_y > 0 && grid_z > 0;
-                }
-            };
-
-            }  // anonymous namespace
-
-        """
-        return source_codes
+        return ""
 
     def cpp_stream_type(self) -> str:
         return "sycl::queue*"
@@ -69,6 +58,11 @@ class XPUDeviceOpOverrides(DeviceOpOverrides):
 
     def cpp_device_ptr(self) -> str:
         return "void *"
+
+    def cpp_scratch(
+        self, idx: int, workspace: TritonScratchWorkspace, prefix: str | None = None
+    ) -> tuple[list[str], str] | None:
+        return [f"void *global_scratch_{idx} = 0;"], f"global_scratch_{idx}"
 
 
 register_device_op_overrides("xpu", XPUDeviceOpOverrides())

@@ -1,7 +1,8 @@
 # mypy: allow-untyped-defs
 import contextlib
 import itertools
-from typing import Any, Callable, Optional
+from collections.abc import Callable
+from typing import Any
 from unittest.mock import patch
 
 import sympy
@@ -48,7 +49,12 @@ extern "C"
     constexpr int64_t num_threads = {{num_threads}};
     int64_t B_single_thread_block = (B / num_threads) * num_threads;
 
+    {%- set use_dynamic_threads = ((config.cpp.threads < 1) and (num_threads == cpu_count)) or config.cpp.dynamic_threads %}
+    {%- if use_dynamic_threads %}
+    #pragma omp parallel for
+    {%- else %}
     #pragma omp parallel for num_threads({{num_threads}})
+    {%- endif %}
     {%- else %}
     int64_t B_single_thread_block = B;
     {%- endif %}
@@ -82,7 +88,7 @@ class CppBmmTemplate(CppGemmTemplate):
         beta=1,
         alpha=1,
         has_bias=False,
-        epilogue_creator: Optional[Callable[[ir.Buffer], ir.Pointwise]] = None,
+        epilogue_creator: Callable[[ir.Buffer], ir.Pointwise] | None = None,
         should_block_weights: bool = False,
         name="bmm",
     ):
@@ -126,11 +132,18 @@ class CppBmmTemplate(CppGemmTemplate):
 
     @staticmethod
     def check_if_block_weight(W, micro_gemm):
-        return micro_gemm.get_b_layout() != LayoutType.NORMAL or (
-            (not W.get_layout().is_contiguous() or W.get_name() in V.graph.constants)  # type: ignore[union-attr]
-            if isinstance(W, ir.IRNode)
-            else not W.is_contiguous()
+        if not isinstance(W, ir.IRNode):
+            raise AssertionError(f"expected W to be an ir.IRNode, got {type(W)}")
+        _, n = W.get_size()[-2:]
+        result = (
+            not W.get_layout().is_contiguous()
+            or W.get_name() in V.graph.constants
+            or (
+                n % micro_gemm.register_blocking.block_n != 0
+                and micro_gemm.get_b_layout != LayoutType.NORMAL
+            )
         )
+        return result
 
     def get_gemm_function_call(
         self,
@@ -155,7 +168,8 @@ class CppBmmTemplate(CppGemmTemplate):
             call = f"{function_name}({', '.join(x.full_name() for x in arg_defs)});"
             return call
 
-        assert placeholder not in kernel.render_hooks
+        if placeholder in kernel.render_hooks:
+            raise AssertionError(f"render hook already registered for {placeholder}")
         kernel.render_hooks[placeholder] = hook
         return placeholder
 
@@ -169,9 +183,9 @@ class CppBmmTemplate(CppGemmTemplate):
     def get_options(
         self,
         kernel: CppTemplateKernel,
-        template_buffer_node: Optional[ir.CppTemplateBuffer] = None,
-        flag_template_buffer_has_other_users: Optional[bool] = None,
-        epilogue_nodes: Optional[list[ir.IRNode]] = None,
+        template_buffer_node: ir.CppTemplateBuffer | None = None,
+        flag_template_buffer_has_other_users: bool | None = None,
+        epilogue_nodes: list[ir.IRNode] | None = None,
         **kwargs,
     ) -> dict[str, Any]:
         options = super().get_options(
@@ -203,9 +217,9 @@ class CppBmmTemplate(CppGemmTemplate):
     def render(  # type: ignore[override, return]
         self,
         kernel: CppTemplateKernel,
-        template_buffer_node: Optional[ir.CppTemplateBuffer] = None,
-        flag_template_buffer_has_other_users: Optional[bool] = None,
-        epilogue_nodes: Optional[list[ir.IRNode]] = None,
+        template_buffer_node: ir.CppTemplateBuffer | None = None,
+        flag_template_buffer_has_other_users: bool | None = None,
+        epilogue_nodes: list[ir.IRNode] | None = None,
         **kwargs,
     ) -> str:
         options = self.get_options(

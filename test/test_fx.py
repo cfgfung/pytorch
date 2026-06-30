@@ -1,10 +1,12 @@
 # Owner(s): ["module: fx"]
 # ruff: noqa: F841
+# flake8: noqa: E221
 
 import builtins
 import collections
 import contextlib
 import copy
+import gc
 import functools
 import inspect
 import io
@@ -18,15 +20,28 @@ import traceback
 import types
 import typing
 import unittest
+import weakref
 import warnings
-from collections import namedtuple
-from copy import deepcopy
 from math import sqrt
-from typing import Any, Callable, NamedTuple, Optional, Union
+from torch.multiprocessing import Process
+from torch.testing import FileCheck
+from torch.testing._internal.common_methods_invocations import op_db
+from torch.testing._internal.common_device_type import ops, onlyCPU, instantiate_device_type_tests
+import torch.utils._pytree as pytree
+import torch.fx._pytree as fx_pytree
+from torch.fx import symbolic_trace, Proxy, Node, GraphModule, Interpreter, Tracer, Transformer, Graph, wrap, PH, CodeGen
+from torch.fx.node import Target, Argument, ArgumentT, _format_arg
+from torch.fx.passes import shape_prop
+from torch.fx.immutable_collections import immutable_dict, immutable_list
+from torch.fx.experimental.rewriter import RewritingTracer
+from torch.fx.operator_schemas import get_signature_for_torch_op
+from copy import deepcopy
+from collections import namedtuple
+from typing import Any, NamedTuple
+from collections.abc import Callable
 
 import torch
-import torch.fx._pytree as fx_pytree
-import torch.utils._pytree as pytree
+
 from functorch.experimental import control_flow
 
 from fx.named_tup import MyNamedTup
@@ -43,48 +58,36 @@ from fx.test_gradual_type import (  # noqa: F401  # noqa: F401
     TypeCheckerTest,
 )
 from fx.test_matcher_utils import TestMatcher  # noqa: F401
+from fx.test_opaque_infrastructure import TestOpaqueInfrastructure  # noqa: F401
 from fx.test_pass_infra import TestPassManager  # noqa: F401
 from fx.test_source_matcher_utils import TestSourceMatcher  # noqa: F401
 from fx.test_subgraph_rewriter import TestSubgraphRewriter  # noqa: F401
-from torch.fx import (
-    CodeGen,
-    Graph,
-    GraphModule,
-    Interpreter,
-    Node,
-    PH,
-    Proxy,
-    symbolic_trace,
-    Tracer,
-    Transformer,
-    wrap,
-)
 from torch.fx._compatibility import _BACK_COMPAT_OBJECTS, _MARKED_WITH_COMPATIBILITY
 from torch.fx._symbolic_trace import PHBase, PHWithMeta
-from torch.fx.experimental.rewriter import RewritingTracer
-from torch.fx.immutable_collections import immutable_dict, immutable_list
-from torch.fx.node import _format_arg, Argument, Target
-from torch.fx.operator_schemas import get_signature_for_torch_op
-from torch.fx.passes import shape_prop
 
 from torch.fx.proxy import TraceError
-from torch.multiprocessing import Process
-from torch.testing import FileCheck
-from torch.testing._internal.common_device_type import (
-    instantiate_device_type_tests,
-    onlyCPU,
-    ops,
-)
-from torch.testing._internal.common_methods_invocations import op_db
+from torch.testing._internal.common_cuda import blas_library_context
 from torch.testing._internal.common_utils import (
     find_library_location,
     IS_FBCODE,
     IS_MACOS,
+    IS_ARM64,
+    IS_LINUX,
     IS_WINDOWS,
+    TEST_WITH_CROSSREF,
+    TEST_WITH_ROCM,
     run_tests,
     skipIfTorchDynamo,
+    xfailIf,
+    xfailIfNoAcceleratorTriton,
 )
 from torch.testing._internal.jit_utils import JitTestCase
+
+import json
+import tempfile
+from torch.profiler import profile, ProfilerActivity
+from torch.profiler._utils import map_recorded_events_to_aten_ops_with_stack_trace
+from torch.autograd.profiler_util import _canonicalize_profiler_events
 
 try:
     from torchvision import models as torchvision_models
@@ -195,7 +198,7 @@ class Pair(NamedTuple):
 
 
 # for testing pytrees
-class Foo:  # noqa: B209
+class Foo:
     def __init__(self, a, b):
         self.a = a
         self.b = b
@@ -212,10 +215,40 @@ def side_effect_func(x: torch.Tensor):
     print(x)
 
 
+def _enrich_profiler_traces(prof):
+    """
+    Helper function to extract and augment profiler events with stack traces.
+
+    Args:
+        prof: A torch.profiler.profile object
+
+    Returns:
+        A string representing enriched events
+    """
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.json') as f:
+        trace_file = f.name
+        prof.export_chrome_trace(trace_file)
+
+        with open(trace_file) as f:
+            trace_data = json.load(f)
+
+        map_recorded_events_to_aten_ops_with_stack_trace(
+            trace_data
+        )
+
+        events = []
+        for event in trace_data["traceEvents"]:
+            if "args" in event and "stack_trace" in event["args"]:
+                events.append(event)
+
+        actual_traces = _canonicalize_profiler_events(events)
+        return actual_traces
+
+
 class TestFX(JitTestCase):
     def setUp(self):
         super().setUp()
-        # Checking for mutable operations whil tracing is feature flagged
+        # Checking for mutable operations while tracing is feature flagged
         # Enable it in testing but not by default
         self.orig_tracer_mutable_flag = (
             torch.fx.proxy.TracerBase.check_mutable_operations
@@ -318,6 +351,42 @@ class TestFX(JitTestCase):
         x, y = torch.rand(1), torch.rand(1)
         self.assertEqual(torch.sin(x + y), gm(x, y))
 
+    def test_boxed_arg_indices_codegen(self):
+        def multi_boxed_call(left, passthrough, right):
+            return left[0] + left[1] + passthrough + right[0]
+
+        graph = torch.fx.Graph()
+        a = graph.placeholder("a")
+        b = graph.placeholder("b")
+        c = graph.placeholder("c")
+        d = graph.placeholder("d")
+        out = graph.call_function(multi_boxed_call, ([a, b], c, [d]))
+        out.meta["boxed_arg_indices"] = (0, 2)
+        graph.output(out)
+        gm = GraphModule(torch.nn.Module(), graph)
+
+        self.assertEqual(gm(1, 2, 3, 4), 10)
+        self.assertIn("multi_boxed_call_boxed_arg_0 = [a, b]", gm.code)
+        self.assertIn("multi_boxed_call_boxed_arg_2 = [d];  a = b = d = None", gm.code)
+        self.assertRegex(
+            gm.code,
+            r"multi_boxed_call\(multi_boxed_call_boxed_arg_0, c, multi_boxed_call_boxed_arg_2\)",
+        )
+        boxed_arg_cleanup = "multi_boxed_call_boxed_arg_0 = multi_boxed_call_boxed_arg_2 = None"
+        self.assertIn(boxed_arg_cleanup, gm.code)
+
+        graph = torch.fx.Graph()
+        a = graph.placeholder("a")
+        b = graph.placeholder("b")
+        out = graph.call_function(multi_boxed_call, ([a, b], a, [b]))
+        out.meta["boxed_arg_indices"] = (0, 2)
+        graph.output(out)
+        gm = GraphModule(torch.nn.Module(), graph)
+
+        self.assertEqual(gm(1, 2), 6)
+        self.assertIn("multi_boxed_call_boxed_arg_2 = [b];  b = None", gm.code)
+        self.assertNotIn("a = b = None", gm.code)
+
     def test_args_kwargs(self):
         class T(torch.nn.Module):
             def forward(self, *args, **kwargs):
@@ -344,7 +413,7 @@ class TestFX(JitTestCase):
 
     def test_args_kwargs_no_self(self):
         class T(torch.nn.Module):
-            def forward(*args, **kwargs):  # noqa: B902
+            def forward(*args, **kwargs):
                 self = args[0]
                 return torch.relu(args[1])
 
@@ -425,11 +494,11 @@ class TestFX(JitTestCase):
             def create_node(
                 self,
                 kind: str,
-                target: Union[str, Callable],
+                target: str | Callable,
                 args: tuple[Argument, ...],
                 kwargs: dict[str, Any],
-                name: Optional[str] = None,
-                type_expr: Optional[Any] = None,
+                name: str | None = None,
+                type_expr: Any | None = None,
             ) -> Node:
                 name = target if isinstance(target, str) else torch.typename(target)
                 if name[-1] == "_":
@@ -719,30 +788,38 @@ class TestFX(JitTestCase):
         gm = GraphModule(m, new_g)
         seen_names: set[str] = set()
         for node in gm.graph.nodes:
-            assert node.name not in seen_names
+            if node.name in seen_names:
+                raise AssertionError(f"Duplicate node name: {node.name}")
             seen_names.add(node.name)
 
     def test_stack_traces(self):
+        def foo(a, b):
+            return a * b
+
         class M(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+
             def forward(self, a, b):
-                return a + b
+                c = a + b
+                c = foo(a, c)
+                return c
 
         tracer = torch.fx.Tracer()
         tracer.record_stack_traces = True
 
         graph = tracer.trace(M())
         # saving the original list because we will insert new nodes as a part of a test
-        orig_graph_nodes = list(graph.nodes)
-        for node in orig_graph_nodes:
-            if node.op == "output":
-                continue
-            self.assertTrue(node.stack_trace is not None)
-            assert "test_fx.py" in node.stack_trace
-
-            # verify that copying the node does not lose the stack trace
-            new_node = graph.node_copy(node)
-            self.assertTrue(new_node.stack_trace is not None)
-            assert "test_fx.py" in new_node.stack_trace
+        stack_traces = "\n".join([node.meta.get("stack_trace", "") for node in graph.nodes])
+        FileCheck().check_count(
+            "c = a + b", 1, exactly=True
+        ).run(stack_traces.strip())
+        FileCheck().check_count(
+            "c = foo(a, c)", 1, exactly=True
+        ).run(stack_traces.strip())
+        FileCheck().check_count(
+            "return a * b", 1, exactly=True
+        ).run(stack_traces.strip())
 
     def test_stack_traces_with_transformer(self):
         class M(torch.nn.Module):
@@ -761,7 +838,25 @@ class TestFX(JitTestCase):
             if node.op in {"placeholder", "output"}:
                 continue
             self.assertTrue(node.stack_trace is not None)
-            assert "test_fx.py" in node.stack_trace
+            if "test_fx.py" not in node.stack_trace:
+                raise AssertionError(
+                    f"Expected 'test_fx.py' in node.stack_trace, got {node.stack_trace}"
+                )
+
+    def test_node_pickle_type_preservation(self):
+        g = Graph()
+        n = g.placeholder("x")
+        n.type = torch.Tensor
+
+        dumped_node = pickle.dumps(n)
+        restored_node = pickle.loads(dumped_node)
+        self.assertEqual(restored_node.type, torch.Tensor)
+        self.assertNotEqual(restored_node.type, restored_node.target)
+
+        dumped_graph = pickle.dumps(g)
+        restored_graph = pickle.loads(dumped_graph)
+        restored_n = next(iter(restored_graph.nodes))
+        self.assertEqual(restored_n.type, torch.Tensor)
 
     def test_lineno_map(self):
         class M(torch.nn.Module):
@@ -775,6 +870,7 @@ class TestFX(JitTestCase):
         gm = GraphModule(tracer.root, graph)
         expected = {1: 2, 2: 3, 3: 4, 4: 5}
         self.assertTrue(set(expected.items()).issubset(set(gm._lineno_map.items())))
+        self.assertEqual(gm._prologue_start, 4)
 
         # test custom codegen
         def transform_code(code):
@@ -784,6 +880,7 @@ class TestFX(JitTestCase):
         gm.recompile()
         expected = {2: 2, 3: 3, 4: 4, 5: 5}
         self.assertTrue(set(expected.items()).issubset(set(gm._lineno_map.items())))
+        self.assertEqual(gm._prologue_start, 4)
 
     def test_graph_unique_names_manual(self):
         graph: torch.fx.Graph = torch.fx.Graph()
@@ -799,7 +896,8 @@ class TestFX(JitTestCase):
         graph2.graph_copy(graph, val_map)
         seen_names: set[str] = set()
         for node in graph2.nodes:
-            assert node.name not in seen_names
+            if node.name in seen_names:
+                raise AssertionError(f"Duplicate node name: {node.name}")
             seen_names.add(node.name)
 
     def test_unpack(self):
@@ -859,20 +957,22 @@ class TestFX(JitTestCase):
 
             target_to_name = {operator.add: "add", operator.mul: "mul"}
 
-            output_node: Optional[Node] = None
+            output_node: Node | None = None
             # For each instruction, create a triple
             # (instruction_name : str, inputs : List[str], output : str)
             # to feed into the C++ interpreter
             for n in mod.graph.nodes:
                 target, args, out_name = n.target, n.args, n.name
-                assert len(n.kwargs) == 0, "kwargs currently not supported"
+                if len(n.kwargs) != 0:
+                    raise AssertionError("kwargs currently not supported")
 
                 if n.op == "placeholder":
                     # Placeholders specify function argument names. Save these
                     # for later when we generate the wrapper GraphModule
                     fn_input_names.append(target)
                 elif n.op == "call_function":
-                    assert target in target_to_name, "Unsupported call target " + target
+                    if target not in target_to_name:
+                        raise AssertionError("Unsupported call target " + str(target))
                     arg_names = []
                     for arg in args:
                         if not isinstance(arg, Node):
@@ -903,7 +1003,11 @@ class TestFX(JitTestCase):
             # Load instructions
             interpreter.set_instructions(instructions)
             # Specify name for single output
-            assert isinstance(output_node.args[0], torch.fx.Node)
+            if not isinstance(output_node.args[0], torch.fx.Node):
+                raise AssertionError(
+                    f"Expected output_node.args[0] to be torch.fx.Node, "
+                    f"got {type(output_node.args[0])}"
+                )
             interpreter.set_output_name(output_node.args[0].name)
 
             # ===== Stage 3: Create a wrapper GraphModule around the interpreter =====
@@ -915,7 +1019,7 @@ class TestFX(JitTestCase):
             wrapper = WrapperModule(interpreter)
 
             # Create a graph that: 1) Takes function arguments 2) Invokes the interpreter
-            # 3) Returns the speficied return value
+            # 3) Returns the specified return value
 
             # FIXME: The following code could be greatly simplified by symbolic_trace'ing
             # the wrapper with a Tracer that considers the Wrapper instance a root
@@ -961,7 +1065,7 @@ class TestFX(JitTestCase):
         script_out = scripted_lowered(x)
         torch.testing.assert_close(script_out, ref_out)
 
-        # Test TorchScript ser/de
+        # Test TorchScript Ser/De
         import_copy = self.getExportImportCopy(scripted_lowered)
         imported_out = import_copy(x)
         torch.testing.assert_close(imported_out, ref_out)
@@ -979,6 +1083,7 @@ class TestFX(JitTestCase):
         for node in m_g.graph.nodes:
             self.assertTrue(node.name != "getattr")
 
+    @unittest.skip("https://github.com/pytorch/pytorch/issues/74208")
     @unittest.skip("Hotfix for SEV remediation")
     def test_trace_buffer_slice(self):
         bs, d_hid = 10, 23
@@ -1015,11 +1120,11 @@ class TestFX(JitTestCase):
             def create_node(
                 self,
                 kind: str,
-                target: Union[str, Callable],
+                target: str | Callable,
                 args: tuple[Argument, ...],
                 kwargs: dict[str, Any],
-                name: Optional[str] = None,
-                type_expr: Optional[Any] = None,
+                name: str | None = None,
+                type_expr: Any | None = None,
             ) -> Node:
                 n = super().create_node(kind, target, args, kwargs, name)
                 n.tag = "foo"
@@ -1286,6 +1391,73 @@ class TestFX(JitTestCase):
             "call_module"
         ).check("clamp").check("call_method").run(all_formatted)
 
+    def test_print_graph(self):
+        op: torch._ops.OpOverload = torch.ops.aten.relu.default
+        type_name: str = torch.typename(op)
+
+        graph: torch.fx.Graph = torch.fx.Graph()
+        a: torch.fx.Node = graph.create_node("placeholder", "x")
+        b: torch.fx.Node = graph.create_node("call_function", op, (a,), type_expr=type_name)
+        c: torch.fx.Node = graph.create_node("call_function", op, (b,), type_expr=type_name)
+        graph.output((b, c))
+
+        gm: torch.fx.GraphModule = torch.fx.GraphModule(
+            torch.nn.Module(), graph
+        )
+        gm.graph.lint()
+        text = gm.print_readable(False)
+        count = text.count("_torch__ops_aten_aten_relu_")
+        if count != 2:
+            raise AssertionError(
+                f"Expected 2 occurrences of '_torch__ops_aten_aten_relu_', got {count}"
+            )
+
+    def test_print_readable_no_trailing_whitespace_with_inner_graph(self):
+        # When a GraphModule has a child GraphModule (e.g., from invoke_subgraph),
+        # print_readable() should not produce lines with trailing whitespace.
+
+        # Create an inner GraphModule
+        class InnerModule(torch.nn.Module):
+            def forward(self, x):
+                return x + 1
+
+        inner_gm = torch.fx.symbolic_trace(InnerModule())
+
+        # Create an outer module that has the inner GraphModule as a submodule
+        class OuterModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.subgraph_0 = inner_gm
+
+            def forward(self, x):
+                return x * 2
+
+        outer = OuterModule()
+
+        # Create a graph that references the submodule
+        graph = torch.fx.Graph()
+        x = graph.placeholder("x")
+        subgraph_result = graph.call_module("subgraph_0", (x,))
+        mul_result = graph.call_function(torch.mul, (subgraph_result, 2))
+        graph.output(mul_result)
+
+        # Create the outer GraphModule with this graph
+        outer_gm = torch.fx.GraphModule(outer, graph)
+
+        # Verify that subgraph_0 is a GraphModule with a graph attribute
+        self.assertTrue(hasattr(outer_gm.subgraph_0, "graph"))
+
+        # Get the print_readable output
+        output = outer_gm.print_readable(print_output=False)
+
+        # Check for trailing whitespace on any line
+        for i, line in enumerate(output.split("\n")):
+            self.assertEqual(
+                line,
+                line.rstrip(),
+                lambda msg: f"{msg}\nLine {i + 1} has trailing whitespace: {repr(line)}",
+            )
+
     def test_script_tensor_constant(self):
         # TorchScript seems to ignore attributes that start with `__`.
         # We used to call anonymous Tensor values `__tensor_constant*`, but
@@ -1426,8 +1598,15 @@ class TestFX(JitTestCase):
 
         for node in gm.graph.nodes:
             if node.op == "call_function":
-                assert isinstance(node.target, torch._ops.OpOverload)
-                assert node.target.__name__ == "add.Tensor"
+                if not isinstance(node.target, torch._ops.OpOverload):
+                    raise AssertionError(
+                        f"Expected node.target to be OpOverload, got {type(node.target)}"
+                    )
+                if node.target.__name__ != "add.Tensor":
+                    raise AssertionError(
+                        f"Expected node.target.__name__ to be 'add.Tensor', "
+                        f"got {node.target.__name__}"
+                    )
 
     def test_pickle_torch_custom_ops(self):
         class M(torch.nn.Module):
@@ -1450,8 +1629,10 @@ class TestFX(JitTestCase):
         traced = symbolic_trace(st)
         traced.graph.lint()
         printed = str(traced)
-        assert "SimpleTest()" in printed
-        assert "torch.relu" in printed
+        if "SimpleTest()" not in printed:
+            raise AssertionError(f"Expected 'SimpleTest()' in printed, got {printed}")
+        if "torch.relu" not in printed:
+            raise AssertionError(f"Expected 'torch.relu' in printed, got {printed}")
 
     def test_pretty_print_graph(self):
         class KwargPrintTest(torch.nn.Module):
@@ -1463,7 +1644,8 @@ class TestFX(JitTestCase):
         traced.graph.lint()
         stringed = str(traced.graph)
         for s in ["args", "kwargs", "num_users"]:
-            assert s in stringed
+            if s not in stringed:
+                raise AssertionError(f"Expected '{s}' in stringed graph output")
 
     def test_custom_proxy_type(self):
         class TensorPair:
@@ -1613,6 +1795,25 @@ class TestFX(JitTestCase):
 
         self.assertTrue(neg not in relu.users)
 
+    @skipIfTorchDynamo("Dynamo does not free right away")
+    def test_prepend_does_not_leak(self):
+        g = Graph()
+        x = g.placeholder("x")
+        relu = g.call_function(torch.relu, (x,))
+        neg = g.call_function(torch.neg, (x,))
+
+        relu.prepend(neg)
+
+        ref = weakref.ref(neg)
+        g.erase_node(neg)
+        del g
+        del x
+        del relu
+        del neg
+        gc.collect()
+
+        self.assertIsNone(ref())
+
     def test_remove_uses_with_custom_filter(self):
         g: torch.fx.Graph = Graph()
         x: torch.fx.Node = g.placeholder("x")
@@ -1662,7 +1863,10 @@ class TestFX(JitTestCase):
         )
         gm.graph.lint()
 
-        assert "self.foo.bar.baz" in gm.code
+        if "self.foo.bar.baz" not in gm.code:
+            raise AssertionError(
+                f"Expected 'self.foo.bar.baz' in gm.code, got {gm.code}"
+            )
 
         x: torch.Tensor = torch.rand(3, 3)
         out: torch.Tensor = gm(x)
@@ -1728,7 +1932,10 @@ class TestFX(JitTestCase):
         m = Root()
         graph = CreateArgTracer().trace(m)
         gm = torch.fx.GraphModule(m, graph)
-        assert "CustomArgObject(" in gm.code
+        if "CustomArgObject(" not in gm.code:
+            raise AssertionError(
+                f"Expected 'CustomArgObject(' in gm.code, got {gm.code}"
+            )
 
     def test_trace_fn_constant(self):
         some_constant = torch.rand(3, 4)
@@ -1793,8 +2000,8 @@ class TestFX(JitTestCase):
 
         # Make sure we're testing all opcodes
         opcodes = set()
-        output_shape: Optional[torch.Shape] = None
-        output_stride: Optional[tuple[int]] = None
+        output_shape: torch.Shape | None = None
+        output_stride: tuple[int] | None = None
         for node in tc_traced.graph.nodes:
             opcodes.add(node.op)
             if node.op == "output":
@@ -1831,10 +2038,13 @@ class TestFX(JitTestCase):
         x = torch.randn(5, 5, 224, 224)
         shape_prop.ShapeProp(traced).propagate(x)
 
-        assert all(
+        if not all(
             node.meta["tensor_meta"].memory_format is torch.contiguous_format
             for node in traced.graph.nodes
-        )
+        ):
+            raise AssertionError(
+                "Expected all nodes to have contiguous_format memory_format"
+            )
 
         x_channels_last = x.contiguous(memory_format=torch.channels_last)
         traced.to(memory_format=torch.channels_last)
@@ -1843,7 +2053,7 @@ class TestFX(JitTestCase):
             # NB: the implementation of conv may not preserve the memory format,
             # unfortunately. The best we can do is just check that the placeholder
             # node is channels-last
-            if node.op in {"placeholder"}:
+            if node.op == "placeholder":
                 self.assertEqual(
                     node.meta["tensor_meta"].memory_format, torch.channels_last
                 )
@@ -1874,11 +2084,20 @@ class TestFX(JitTestCase):
 
         for node in mod.graph.nodes:
             if node.op == "call_module":
-                assert "tensor_meta" in node.meta
+                if "tensor_meta" not in node.meta:
+                    raise AssertionError("Expected 'tensor_meta' in node.meta")
                 tensor_meta = node.meta["tensor_meta"]
-                assert tensor_meta[0] == 3
-                assert tensor_meta[1].shape == torch.Size([])
+                if tensor_meta[0] != 3:
+                    raise AssertionError(
+                        f"Expected tensor_meta[0] == 3, got {tensor_meta[0]}"
+                    )
+                if tensor_meta[1].shape != torch.Size([]):
+                    raise AssertionError(
+                        f"Expected tensor_meta[1].shape == torch.Size([]), "
+                        f"got {tensor_meta[1].shape}"
+                    )
 
+    @xfailIf(IS_ARM64 and IS_LINUX) # RuntimeError: label is too far
     def test_shape_prop_layout_3d(self):
         class ConvTest3d(torch.nn.Module):
             def __init__(self) -> None:
@@ -1892,10 +2111,13 @@ class TestFX(JitTestCase):
         traced_3d = symbolic_trace(test_mod_3d)
         x_3d = torch.randn(5, 5, 224, 224, 15)
         shape_prop.ShapeProp(traced_3d).propagate(x_3d)
-        assert all(
+        if not all(
             node.meta["tensor_meta"].memory_format is torch.contiguous_format
             for node in traced_3d.graph.nodes
-        )
+        ):
+            raise AssertionError(
+                "Expected all 3d nodes to have contiguous_format memory_format"
+            )
 
         x_channels_last_3d = x_3d.contiguous(memory_format=torch.channels_last_3d)
         traced_3d.to(memory_format=torch.channels_last_3d)
@@ -1904,7 +2126,7 @@ class TestFX(JitTestCase):
             # NB: the implementation of conv may not preserve the memory format,
             # unfortunately. The best we can do is just check that the placeholder
             # node is channels-last
-            if node.op in {"placeholder"}:
+            if node.op == "placeholder":
                 self.assertEqual(
                     node.meta["tensor_meta"].memory_format, torch.channels_last_3d
                 )
@@ -2000,6 +2222,31 @@ class TestFX(JitTestCase):
         self.assertEqual(interpreter.run(input), gm(input))
         self.assertEqual(interpreter.run(input), m(input))
 
+    def test_interpreter_boxed_run_argument_validation(self):
+        class AddModule(torch.nn.Module):
+            def forward(self, lhs, rhs):
+                return lhs + rhs
+
+        gm = torch.fx.symbolic_trace(AddModule())
+        interpreter = Interpreter(gm)
+
+        lhs = torch.tensor(1.0)
+        rhs = torch.tensor(2.0)
+        good_args = [lhs.clone(), rhs.clone()]
+        result = interpreter.boxed_run(good_args)
+        torch.testing.assert_close(result, lhs + rhs)
+        self.assertEqual(good_args, [])
+
+        extra_args = [lhs.clone(), rhs.clone(), torch.tensor(3.0)]
+        with self.assertRaisesRegex(RuntimeError, "extra arguments"):
+            interpreter.boxed_run(extra_args)
+        self.assertEqual(len(extra_args), 3)
+
+        missing_args = [lhs.clone()]
+        with self.assertRaisesRegex(RuntimeError, "missing arguments"):
+            interpreter.boxed_run(missing_args)
+        self.assertEqual(len(missing_args), 1)
+
     def test_interpreter_other_graph(self):
         class MyModule(torch.nn.Module):
             def __init__(self) -> None:
@@ -2043,7 +2290,10 @@ class TestFX(JitTestCase):
         input = torch.randn(3, 4)
         RunNodeInterpreter(gm).run(input)
         for node in gm.graph.nodes:
-            assert hasattr(node, "cached_value")
+            if not hasattr(node, "cached_value"):
+                raise AssertionError(
+                    f"Expected node {node.name} to have 'cached_value' attribute"
+                )
 
     def test_interpreter_onthefly_swap(self):
         def fn(x):
@@ -2084,7 +2334,8 @@ class TestFX(JitTestCase):
             if node.op == "call_module" and node.target == "linear":
                 env[node] = torch.arange(0, 12, 1).reshape(3, 4) - 6.0
                 break
-        assert len(env) == 1
+        if len(env) != 1:
+            raise AssertionError(f"Expected len(env) == 1, got {len(env)}")
         x = torch.randn(3, 4)
         result = interp.run(x, initial_env=env)
         self.assertEqual(
@@ -2113,7 +2364,7 @@ class TestFX(JitTestCase):
         interp = Interpreter(symbolic_trace(rn18))
         inp = torch.rand(5, 3, 224, 224)
         out = interp.run(inp)
-        env_key_names = {n.name for n in interp.env.keys()}
+        env_key_names = {n.name for n in interp.env}
         self.assertEqual(env_key_names, {"output"})
 
     def test_interpreter_default_args(self):
@@ -2215,8 +2466,8 @@ class TestFX(JitTestCase):
         foo_scripted = torch.jit.script(Foo())
         foo_scripted(Pair(torch.rand(5), torch.rand(5)), torch.rand(5), 3)
 
-        fxed = symbolic_trace(Foo())
-        fxed_scripted = torch.jit.script(fxed)
+        fixed = symbolic_trace(Foo())
+        fxed_scripted = torch.jit.script(fixed)
         fxed_scripted(Pair(torch.rand(5), torch.rand(5)), torch.rand(5), 3)
 
     def test_fn_type_annotation_empty(self):
@@ -2247,6 +2498,29 @@ class TestFX(JitTestCase):
         graph = torch.fx.Graph()
         gm = torch.fx.GraphModule(torch.nn.Module(), graph)
         self.assertEqual(gm(), None)
+
+    def test_complex_constant_codegen_preserves_signed_zero(self):
+        values = [
+            complex(-0.0, -1e-28),
+            complex(-0.0, 1e-28),
+            complex(0.0, -1e-28),
+            complex(1.0, -0.0),
+            complex(0.0, -0.0),
+        ]
+
+        graph = torch.fx.Graph()
+        tensor = graph.call_function(
+            torch.tensor, args=(values,), kwargs={"dtype": torch.complex64}
+        )
+        graph.output(tensor)
+        gm = torch.fx.GraphModule(torch.nn.Module(), graph)
+
+        expected = torch.tensor(values, dtype=torch.complex64)
+        result = gm()
+        self.assertEqual(result, expected)
+        self.assertEqual(torch.signbit(result.real), torch.signbit(expected.real))
+        self.assertEqual(torch.signbit(result.imag), torch.signbit(expected.imag))
+        self.assertIn("complex(-0.0, -1e-28)", gm.code)
 
     def test_sequential(self):
         m = torch.nn.Sequential(torch.nn.Conv2d(1, 1, 1))
@@ -2284,6 +2558,16 @@ class TestFX(JitTestCase):
         output : torch.fx.Node = graph.output(b)
 
         self.assertTrue("typing.List[float]" in str(graph))
+
+    def test_typename_print_union(self):
+        graph: torch.fx.Graph = torch.fx.Graph()
+        x: torch.fx.Node = graph.create_node("placeholder", "x")
+        b: torch.fx.Node = graph.create_node(
+            "call_function", target=torch.relu, args=(x,), type_expr=float|torch.Tensor|None
+        )
+        output: torch.fx.Node = graph.output(b)
+
+        self.assertTrue('float | torch.Tensor | None' in str(graph))
 
     def test_layout(self):
         class M(torch.nn.Module):
@@ -2333,15 +2617,13 @@ class TestFX(JitTestCase):
 
         g = torch.fx.Graph()
         x = g.placeholder("x")
-        for i in range(depth):
+        for _ in range(depth):
             x = g.call_function(torch.relu, (x,))
         g.output(x)
 
         copied_graph = copy.deepcopy(g)
 
-        val_map = {}
-        for orig_node, new_node in zip(g.nodes, copied_graph.nodes):
-            val_map[orig_node] = new_node
+        val_map = dict(zip(g.nodes, copied_graph.nodes))
 
         for orig_node, new_node in zip(g.nodes, copied_graph.nodes):
             orig_users = set(orig_node.users.keys())
@@ -2454,22 +2736,34 @@ class TestFX(JitTestCase):
         l = immutable_list([3, [rand_tensor, 42]])
 
         flattened, spec = pytree.tree_flatten(l)
-        assert flattened == [3, rand_tensor, 42]
+        if flattened != [3, rand_tensor, 42]:
+            raise AssertionError(
+                f"Expected flattened == [3, rand_tensor, 42], got {flattened}"
+            )
 
         unflattened = pytree.tree_unflatten(flattened, spec)
-        assert unflattened == l
-        assert isinstance(unflattened, immutable_list)
+        if unflattened != l:
+            raise AssertionError("Expected unflattened == l")
+        if not isinstance(unflattened, immutable_list):
+            raise AssertionError(
+                f"Expected unflattened to be immutable_list, got {type(unflattened)}"
+            )
 
     def test_immutable_dict_pytree_ops(self):
         rand_tensor = torch.randn(5, 3)
         d = immutable_dict({"a": 3, "b": [rand_tensor, 42]})
 
         flattened, spec = pytree.tree_flatten(d)
-        assert flattened == [3, rand_tensor, 42]
+        if flattened != [3, rand_tensor, 42]:
+            raise AssertionError("Expected flattened == [3, rand_tensor, 42]")
 
         unflattened = pytree.tree_unflatten(flattened, spec)
-        assert unflattened == d
-        assert isinstance(unflattened, immutable_dict)
+        if unflattened != d:
+            raise AssertionError("Expected unflattened == d")
+        if not isinstance(unflattened, immutable_dict):
+            raise AssertionError(
+                f"Expected unflattened to be immutable_dict, got {type(unflattened)}"
+            )
 
     def test_move_before(self):
         graph: torch.fx.Graph = torch.fx.Graph()
@@ -2540,7 +2834,11 @@ class TestFX(JitTestCase):
         self.assertEqual(len(users_of_x), 3)
         expected_ops = {"relu", "add", "neg"}
         for use in users_of_x:
-            assert any(use.name.startswith(prefix) for prefix in expected_ops)
+            if not any(use.name.startswith(prefix) for prefix in expected_ops):
+                raise AssertionError(
+                    f"Expected use.name to start with one of {expected_ops}, "
+                    f"got {use.name}"
+                )
 
     def test_inline_graph(self):
         class InlineInto(torch.nn.Module):
@@ -2558,7 +2856,11 @@ class TestFX(JitTestCase):
         output_node = combined_graph.graph_copy(inline_into.graph, {})
 
         input_node = next(iter(to_inline.graph.nodes))
-        assert input_node and input_node.op == "placeholder"
+        if not (input_node and input_node.op == "placeholder"):
+            raise AssertionError(
+                f"Expected input_node to exist and have op='placeholder', "
+                f"got {input_node}"
+            )
 
         val_map = {input_node: output_node}
         output = combined_graph.graph_copy(to_inline.graph, val_map)
@@ -2583,7 +2885,10 @@ class TestFX(JitTestCase):
 
         expected_ops = ["x", "neg", "tanh", "relu"]
         for node, expected in zip(graph.nodes, expected_ops):
-            assert expected in node.name
+            if expected not in node.name:
+                raise AssertionError(
+                    f"Expected '{expected}' in node.name, got {node.name}"
+                )
 
     def test_reassign_args_kwargs_uses(self):
         graph = torch.fx.Graph()
@@ -2768,7 +3073,10 @@ class TestFX(JitTestCase):
                 return self.a.b, self.a.b.t(), self.a.b.view(12)
 
         traced = torch.fx.symbolic_trace(Foo())
-        assert all("constant" not in node.target for node in traced.graph.nodes)
+        if not all("constant" not in node.target for node in traced.graph.nodes):
+            raise AssertionError(
+                "Expected no node targets to contain 'constant'"
+            )
 
     def test_single_default_arg(self):
         class M(torch.nn.Module):
@@ -2907,7 +3215,7 @@ class TestFX(JitTestCase):
         for node in traced.graph.nodes:
             if node.op == "placeholder":
                 ph = node
-            elif node.op == "call_function" and node.target == wrapped_named_tup:
+            elif node.op == "call_function" and node.target is wrapped_named_tup:
                 node.update_arg(0, Pair(ph, 1.2))
                 node.update_kwarg("p2", Pair(3.4, ph))
                 call_func = node
@@ -3054,7 +3362,7 @@ class TestFX(JitTestCase):
         from torch.fx.immutable_collections import immutable_list
 
         x = immutable_list([3, 4])
-        with self.assertRaisesRegex(NotImplementedError, "new_args"):
+        with self.assertRaisesRegex(TypeError, "new_args"):
             x[0] = 4
 
     def test_partial_trace(self):
@@ -3070,7 +3378,10 @@ class TestFX(JitTestCase):
         mod_false = symbolic_trace(mod, concrete_args={"y": False})
         self.assertEqual(mod_true(3, True), 6)
         print(mod_true.code)
-        assert any(i.target == torch._assert for i in mod_true.graph.nodes)
+        if not any(i.target is torch._assert for i in mod_true.graph.nodes):
+            raise AssertionError(
+                "Expected at least one node with target torch._assert"
+            )
         with self.assertRaises(AssertionError):
             mod_true(3, False)
         self.assertEqual(mod_false(3, False), 3)
@@ -3153,7 +3464,7 @@ class TestFX(JitTestCase):
     def test_ast_rewriter_rewrites_assert(self):
         class M(torch.nn.Module):
             def forward(self, x: torch.Tensor, y: int, z: int):
-                assert y == z
+                assert y == z  # noqa: S101
                 return torch.add(x, x)
 
         ast_rewriter = RewritingTracer()
@@ -3165,7 +3476,7 @@ class TestFX(JitTestCase):
     def test_ast_rewriter_rewrites_assert_with_message(self):
         class M(torch.nn.Module):
             def forward(self, x: torch.Tensor, y: int, z: int):
-                assert y == z, "msg"
+                assert y == z, "msg"  # noqa: S101
                 return torch.add(x, x)
 
         ast_rewriter = RewritingTracer()
@@ -3377,12 +3688,12 @@ class TestFX(JitTestCase):
 
         def parameter_exists(gm: GraphModule, path: str) -> bool:
             return any(path == name for name, _ in gm.named_parameters()) and any(
-                path == name for name in gm.state_dict().keys()
+                path == name for name in gm.state_dict()
             )
 
         def buffer_exists(gm: GraphModule, path: str) -> bool:
             return any(path == name for name, _ in gm.named_buffers()) and any(
-                path == name for name in gm.state_dict().keys()
+                path == name for name in gm.state_dict()
             )
 
         # Test that we added the "dropout" submodule
@@ -3575,7 +3886,7 @@ class TestFX(JitTestCase):
 
         class LeafTracerNotB(Tracer):
             def is_leaf_module(self, module, name):
-                return False if "b" in name else True
+                return "b" not in name
 
         # Recompile calls added "for fun", since they
         # chain __call__ wrappers.
@@ -3777,25 +4088,6 @@ class TestFX(JitTestCase):
 
         FileCheck().check("Tuple[()]").check("Tuple[str, Tuple[()]]").run(scripted.code)
 
-    @unittest.skipIf(
-        IS_WINDOWS, "Python Windows bug? https://bugs.python.org/issue45108"
-    )
-    @unittest.skipIf(sys.version_info >= (3, 10), "Does not work on Python-3.10")
-    def test_assert(self):
-        def f(x):
-            assert x > 1
-            return x + 1
-
-        try:
-            torch.fx.proxy.TracerBase.trace_asserts = True
-            traced = symbolic_trace(f)
-        finally:
-            torch.fx.proxy.TracerBase.trace_asserts = False
-
-        self.assertEqual(f(2), traced(2))
-        with self.assertRaises(AssertionError):
-            traced(0)
-
     def test_pytree(self):
         # Used to test that you can use your own placeholder class
         class PHTest(PHBase):
@@ -3871,18 +4163,37 @@ class TestFX(JitTestCase):
                 orig_out,
             )
 
-            assert num_flat_args == 0 or "tree_flatten_spec" in nf.code
-            assert sum(i.op == "placeholder" for i in nf.graph.nodes) == num_flat_args
+            if not (num_flat_args == 0 or "tree_flatten_spec" in nf.code):
+                raise AssertionError(
+                    "Expected tree_flatten_spec in nf.code when num_flat_args > 0"
+                )
+            placeholder_count = sum(i.op == "placeholder" for i in nf.graph.nodes)
+            if placeholder_count != num_flat_args:
+                raise AssertionError(
+                    f"Expected {num_flat_args} placeholders, got {placeholder_count}"
+                )
 
             nf = symbolic_trace(nf)
             self.assertEqual(nf(val), orig_out)
-            assert "tree_flatten_spec" not in nf.code
-            assert sum(i.op == "placeholder" for i in nf.graph.nodes) == 1
+            if "tree_flatten_spec" in nf.code:
+                raise AssertionError("Expected tree_flatten_spec not in nf.code")
+            placeholder_count = sum(i.op == "placeholder" for i in nf.graph.nodes)
+            if placeholder_count != 1:
+                raise AssertionError(
+                    f"Expected 1 placeholder, got {placeholder_count}"
+                )
 
             nf = symbolic_trace(nf, concrete_args={"x": inp})
             self.assertEqual(nf(val), orig_out)
-            assert num_flat_args == 0 or "tree_flatten_spec" in nf.code
-            assert sum(i.op == "placeholder" for i in nf.graph.nodes) == num_flat_args
+            if not (num_flat_args == 0 or "tree_flatten_spec" in nf.code):
+                raise AssertionError(
+                    "Expected tree_flatten_spec in nf.code when num_flat_args > 0"
+                )
+            placeholder_count = sum(i.op == "placeholder" for i in nf.graph.nodes)
+            if placeholder_count != num_flat_args:
+                raise AssertionError(
+                    f"Expected {num_flat_args} placeholders, got {placeholder_count}"
+                )
 
             pickled = pickle.dumps(nf)
             nf = pickle.loads(pickled)
@@ -3950,11 +4261,11 @@ class TestFX(JitTestCase):
             def create_node(
                 self,
                 kind: str,
-                target: Union[str, Callable],
+                target: str | Callable,
                 args: tuple[Argument, ...],
                 kwargs: dict[str, Any],
-                name: Optional[str] = None,
-                type_expr: Optional[Any] = None,
+                name: str | None = None,
+                type_expr: Any | None = None,
             ) -> Node:
                 n = super().create_node(kind, target, args, kwargs, name)
                 n.tag = "foo"
@@ -3986,7 +4297,10 @@ def forward(self, args_list: List[torch.Tensor]){maybe_return_annotation}:
                 return [("List", list)]
 
             def process_inputs(self, *inputs):
-                assert len(inputs) == 1
+                if len(inputs) != 1:
+                    raise AssertionError(
+                        f"Expected len(inputs) == 1, got {len(inputs)}"
+                    )
                 return inputs[0]
 
         def f(a, b):
@@ -4023,7 +4337,10 @@ def forward(self, args_list: List[torch.Tensor]){maybe_return_annotation}:
                 return [("List", list)]
 
             def process_inputs(self, *inputs):
-                assert len(inputs) == 1
+                if len(inputs) != 1:
+                    raise AssertionError(
+                        f"Expected len(inputs) == 1, got {len(inputs)}"
+                    )
                 return inputs[0]
 
         def f(a, b):
@@ -4052,7 +4369,10 @@ def forward(self, args_list: List[torch.Tensor]){maybe_return_annotation}:
                 return [("List", list)]
 
             def process_inputs(self, *inputs):
-                assert len(inputs) == 1
+                if len(inputs) != 1:
+                    raise AssertionError(
+                        f"Expected len(inputs) == 1, got {len(inputs)}"
+                    )
                 return inputs[0]
 
             def generate_output(self, output_args):
@@ -4174,6 +4494,527 @@ def forward(self, args_list: List[torch.Tensor]){maybe_return_annotation}:
         # recorver mutable checking flag
         torch.fx.proxy.TracerBase.check_mutable_operations = orig_tracer_mutable_flag
 
+    # This only fails on navi31
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA not available")
+    @torch.fx.experimental._config.patch("enrich_profiler_metadata", True)
+    @blas_library_context("cublaslt")
+    def test_profiler_stack_trace_augmentation(self):
+        """
+        Test that map_recorded_events_to_aten_ops_with_stack_trace correctly
+        augments profiler events with stack traces from FX metadata registry.
+        """
+
+        # Simple test model
+        class TestModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear1 = torch.nn.Linear(10, 16)
+                self.relu = torch.nn.ReLU()
+                self.linear2 = torch.nn.Linear(16, 10)
+
+            def forward(self, x):
+                x = self.linear1(x)
+                x = self.relu(x)
+                x = self.linear2(x)
+                return x
+
+        model = TestModel().cuda()
+
+        # Compile the model
+        compiled_model = torch.compile(model, backend="aot_eager", fullgraph=True)
+
+        # Warmup
+        for _ in range(3):
+            _ = compiled_model(torch.randn(10, 10, device="cuda"))
+
+        # Profile with the compiled model
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        ) as prof:
+            result = compiled_model(torch.randn(10, 10, device="cuda"))
+
+        actual_traces = _enrich_profiler_traces(prof)
+
+        # Handle platform-specific event names
+        if torch.version.hip:
+            actual_traces = '\n'.join(
+                line for line in actual_traces.split('\n')
+                if 'hipGetDeviceProperties' not in line
+            )
+            kernel_event = "hipExtModuleLaunchKernel"
+            kernel_event_relu = "hipLaunchKernel"
+        else:
+            kernel_event = "cudaLaunchKernel"
+            kernel_event_relu = "cudaLaunchKernel"
+        if IS_WINDOWS:
+            expected = f"""\
+event=aten::t node=t stack_trace=return F.linear(input, self.weight, self.bias)
+event=aten::transpose node=t stack_trace=return F.linear(input, self.weight, self.bias)
+event=aten::as_strided node=t stack_trace=return F.linear(input, self.weight, self.bias)
+event=aten::addmm node=addmm stack_trace=return F.linear(input, self.weight, self.bias)
+event=aten::expand node=addmm stack_trace=return F.linear(input, self.weight, self.bias)
+event=aten::as_strided node=addmm stack_trace=return F.linear(input, self.weight, self.bias)
+event={kernel_event} node=addmm stack_trace=return F.linear(input, self.weight, self.bias)
+event={kernel_event} node=addmm stack_trace=return F.linear(input, self.weight, self.bias)
+event=aten::relu node=relu stack_trace=return F.relu(input, inplace=self.inplace)
+event=aten::clamp_min node=relu stack_trace=return F.relu(input, inplace=self.inplace)
+event={kernel_event_relu} node=relu stack_trace=return F.relu(input, inplace=self.inplace)
+event=aten::t node=t_1 stack_trace=return F.linear(input, self.weight, self.bias)
+event=aten::transpose node=t_1 stack_trace=return F.linear(input, self.weight, self.bias)
+event=aten::as_strided node=t_1 stack_trace=return F.linear(input, self.weight, self.bias)
+event=aten::addmm node=addmm_1 stack_trace=return F.linear(input, self.weight, self.bias)
+event=aten::expand node=addmm_1 stack_trace=return F.linear(input, self.weight, self.bias)
+event=aten::as_strided node=addmm_1 stack_trace=return F.linear(input, self.weight, self.bias)
+event={kernel_event} node=addmm_1 stack_trace=return F.linear(input, self.weight, self.bias)
+event={kernel_event} node=addmm_1 stack_trace=return F.linear(input, self.weight, self.bias)"""
+        else:
+            expected = f"""\
+event=aten::t node=t stack_trace=x = self.linear1(x)
+event=aten::transpose node=t stack_trace=x = self.linear1(x)
+event=aten::as_strided node=t stack_trace=x = self.linear1(x)
+event=aten::addmm node=addmm stack_trace=x = self.linear1(x)
+event={kernel_event} node=addmm stack_trace=x = self.linear1(x)
+event=aten::relu node=relu stack_trace=x = self.relu(x)
+event=aten::clamp_min node=relu stack_trace=x = self.relu(x)
+event={kernel_event_relu} node=relu stack_trace=x = self.relu(x)
+event=aten::t node=t_1 stack_trace=x = self.linear2(x)
+event=aten::transpose node=t_1 stack_trace=x = self.linear2(x)
+event=aten::as_strided node=t_1 stack_trace=x = self.linear2(x)
+event=aten::addmm node=addmm_1 stack_trace=x = self.linear2(x)
+event={kernel_event} node=addmm_1 stack_trace=x = self.linear2(x)"""
+
+        self.assertExpectedInline(actual_traces, expected)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA not available")
+    @torch.fx.experimental._config.patch("enrich_profiler_metadata", True)
+    def test_profiler_multiple_modules(self):
+        """
+        Test that multiple compiled modules under the same profiler session
+        have their events correctly augmented with stack traces.
+        """
+
+        class ModelA(torch.nn.Module):
+            def forward(self, x):
+                return x + 1
+
+        class ModelB(torch.nn.Module):
+            def forward(self, x):
+                return x - 1
+
+        model_a = ModelA().cuda()
+        model_b = ModelB().cuda()
+
+        # Compile both models
+        compiled_a = torch.compile(model_a, backend="aot_eager", fullgraph=True)
+        compiled_b = torch.compile(model_b, backend="aot_eager", fullgraph=True)
+
+        # Warmup
+        for _ in range(3):
+            _ = compiled_a(torch.randn(10, 10, device="cuda"))
+            _ = compiled_b(torch.randn(1, 3, 8, 8, device="cuda"))
+
+        # Profile both models in the same session
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        ) as prof:
+            result_a = compiled_a(torch.randn(10, 10, device="cuda"))
+            result_b = compiled_b(torch.randn(1, 3, 8, 8, device="cuda"))
+
+        actual_traces = _enrich_profiler_traces(prof)
+        kernel_event = "hipLaunchKernel" if torch.version.hip else "cudaLaunchKernel"
+        self.assertExpectedInline(actual_traces, f"""\
+event=aten::add node=add stack_trace=return x + 1
+event={kernel_event} node=add stack_trace=return x + 1
+event=aten::sub node=sub stack_trace=return x - 1
+event={kernel_event} node=sub stack_trace=return x - 1"""
+            )
+
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA not available")
+    @torch.fx.experimental._config.patch("enrich_profiler_metadata", True)
+    def test_profiler_nested_graph_modules(self):
+        """
+        Test that nested graph modules (e.g., graph modules calling subgraphs)
+        have their events correctly augmented with stack traces.
+        """
+
+        # Model with nested structure
+        class Mod(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.c = 5
+
+            @torch.compiler.nested_compile_region
+            def forward(self, x, y):
+                m = torch.mul(x, y)
+                s = m.sin()
+                a = s + self.c
+                return a
+
+        model = Mod().cuda()
+
+        # Compile the model (this may create nested graph modules)
+        compiled_model = torch.compile(model, backend="aot_eager", fullgraph=True)
+
+        # Warmup
+        for _ in range(3):
+            _ = compiled_model(torch.randn(10, 10, device="cuda"), torch.randn(10, 10, device="cuda"))
+
+        # Profile
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        ) as prof:
+            result = compiled_model(torch.randn(10, 10, device="cuda"), torch.randn(10, 10, device="cuda"))
+
+        actual_traces = _enrich_profiler_traces(prof)
+        kernel_event = "hipLaunchKernel" if torch.version.hip else "cudaLaunchKernel"
+        self.assertExpectedInline(actual_traces, f"""\
+event=aten::mul node=mul stack_trace=m = torch.mul(x, y)
+event={kernel_event} node=mul stack_trace=m = torch.mul(x, y)
+event=aten::sin node=sin stack_trace=s = m.sin()
+event={kernel_event} node=sin stack_trace=s = m.sin()
+event=aten::add node=add stack_trace=a = s + self.c
+event={kernel_event} node=add stack_trace=a = s + self.c"""
+            )
+
+    @xfailIfNoAcceleratorTriton
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA not available")
+    def test_graph_module_with_hop_serialization(self):
+        """
+        Test that a GraphModule containing HigherOrderOperators that don't take
+        callable arguments can be serialized and deserialized via __reduce__.
+
+        HOPs like triton_kernel_wrapper_functional don't take function arguments,
+        so they can be symbolically traced during deserialization without needing
+        special handling.
+        """
+        from torch._higher_order_ops.triton_kernel_wrap import (
+            kernel_side_table,
+            triton_kernel_wrapper_functional,
+        )
+        from torch._subclasses.fake_tensor import FakeTensorMode
+        from torch.fx.experimental.proxy_tensor import make_fx
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+        from torch.testing._internal.triton_utils import mul2_kernel
+
+        kernel_side_table.reset_table()
+
+        def f(x, output):
+            out = triton_kernel_wrapper_functional(
+                kernel_idx=kernel_side_table.add_kernel(mul2_kernel),
+                constant_args_idx=kernel_side_table.add_constant_args(
+                    {"n_elements": output.numel(), "BLOCK_SIZE": 16}
+                ),
+                grid=[(x.numel(),)],
+                tma_descriptor_metadata={},
+                kwargs={
+                    "in_ptr0": x,
+                    "out_ptr": output,
+                },
+                tensors_to_clone=["in_ptr0", "out_ptr"],
+            )
+            return out["out_ptr"]
+
+        fake_mode = FakeTensorMode(shape_env=ShapeEnv())
+        with fake_mode:
+            t1 = torch.randn(5)
+            t2 = torch.randn(5)
+        gm = make_fx(f, tracing_mode="fake")(t1, t2)
+
+        self.assertTrue(
+            any(
+                node.target == torch.ops.higher_order.triton_kernel_wrapper_functional
+                for node in gm.graph.nodes
+                if node.op == "call_function"
+            ),
+            "Graph should contain triton_kernel_wrapper_functional",
+        )
+
+        from torch._functorch._aot_autograd.aot_autograd_result import (
+            SerializedGraphModule,
+        )
+
+        serialized = SerializedGraphModule(gm)
+        deserialized = serialized.deserialize()
+
+        self.assertIsInstance(deserialized, torch.fx.GraphModule)
+        self.assertTrue(
+            any(
+                node.target == torch.ops.higher_order.triton_kernel_wrapper_functional
+                for node in deserialized.graph.nodes
+                if node.op == "call_function"
+            ),
+            "Deserialized graph should contain triton_kernel_wrapper_functional",
+        )
+
+
+    @staticmethod
+    def _capture_gm(fn, *example_inputs):
+        """Compile ``fn`` with dynamic shapes, return the captured GraphModule."""
+        from torch._dynamo.testing import EagerAndRecordGraphs
+
+        backend = EagerAndRecordGraphs()
+        torch.compile(fn, dynamic=True, backend=backend)(*example_inputs)
+        return backend.graphs[-1]
+
+    @staticmethod
+    def _find_placeholder(gm, example_value_type):
+        """Return the first placeholder whose ``meta['example_value']`` is an
+        instance of ``example_value_type``."""
+        return next(
+            n
+            for n in gm.graph.nodes
+            if n.op == "placeholder"
+            and isinstance(n.meta.get("example_value"), example_value_type)
+        )
+
+    def test_create_tensor_metadata_nodes(self):
+        def check(meta_key):
+            graph = torch.fx.Graph()
+            tensor_node = graph.placeholder("x")
+            fake = torch.empty_strided((2, 3), (5, 2), device="meta")
+            tensor_node.meta[meta_key] = fake
+
+            size_node = graph.create_size_node(tensor_node, 1)
+            stride_node = graph.create_stride_node(tensor_node, 0)
+            storage_offset_node = graph.create_storage_offset_node(tensor_node)
+
+            self.assertEqual(size_node.target, torch.ops.aten.sym_size.int)
+            self.assertEqual(size_node.args, (tensor_node, 1))
+            self.assertEqual(size_node.meta[meta_key], fake.size(1))
+
+            self.assertEqual(stride_node.target, torch.ops.aten.sym_stride.int)
+            self.assertEqual(stride_node.args, (tensor_node, 0))
+            self.assertEqual(stride_node.meta[meta_key], fake.stride(0))
+
+            self.assertEqual(
+                storage_offset_node.target, torch.ops.aten.sym_storage_offset.default
+            )
+            self.assertEqual(storage_offset_node.args, (tensor_node,))
+            self.assertEqual(storage_offset_node.meta[meta_key], fake.storage_offset())
+
+        check("val")
+        check("example_value")
+
+    @unittest.skipIf(TEST_WITH_CROSSREF, "expectedInline graph differs under TorchFunctionMode")
+    def test_materialize_symints_basic(self):
+        """``Graph.materialize_symints`` lowers each SymInt input into an FX
+        subgraph rooted at existing symbol producers."""
+        gm = self._capture_gm(lambda x: x + 1, torch.randn(8, 4))
+        # Pick a tensor placeholder so we can derive its symbolic dims.
+        tensor_placeholder = self._find_placeholder(gm, torch.Tensor)
+        h, _ = tensor_placeholder.meta["example_value"].shape  # h is a SymInt
+        self.assertIsInstance(h, torch.SymInt)
+
+        # Realistic usage: scope the materialization to run before the existing
+        # output so the new nodes land in the body (not orphaned after the
+        # return), and wire the result into the output so they're not dead.
+        output_node = next(n for n in gm.graph.nodes if n.op == "output")
+        with gm.graph.inserting_before(output_node):
+            result = gm.graph.materialize_symints(
+                [h - 1, 3 * (h - 1), (h - 1) ** 2, 5]
+            )
+        output_node.args = (output_node.args[0] + tuple(result),)
+
+        # Plain int passes through, the rest are Nodes.
+        self.assertEqual(result[3], 5)
+        for got in result[:3]:
+            self.assertIsInstance(got, torch.fx.Node)
+
+        # Note: ``h - 1`` is hash-consed across the inputs that share it as a
+        # sub-expression -- ``h - 1`` itself and ``(h - 1) ** 2`` both reference
+        # the same ``%add_1`` (``%pow_1`` takes ``%add_1`` as its base). The
+        # ``3 * (h - 1)`` input is *not* sharing here because sympy distributes
+        # it into ``3*h - 3`` (i.e., ``%mul`` + ``%add_2``), so ``h - 1`` is
+        # not a sub-expression of that lowered form.
+        self.assertExpectedInline(
+            str(gm.graph).strip(),
+            """\
+graph():
+    %s77 : torch.SymInt [num_users=2] = placeholder[target=s77]
+    %s27 : torch.SymInt [num_users=0] = placeholder[target=s27]
+    %l_x_ : torch.Tensor [num_users=1] = placeholder[target=L_x_]
+    %add : [num_users=1] = call_function[target=operator.add](args = (%l_x_, 1), kwargs = {})
+    %add_1 : [num_users=2] = call_function[target=operator.add](args = (-1, %s77), kwargs = {})
+    %mul : [num_users=1] = call_function[target=operator.mul](args = (3, %s77), kwargs = {})
+    %add_2 : [num_users=1] = call_function[target=operator.add](args = (-3, %mul), kwargs = {})
+    %pow_1 : [num_users=1] = call_function[target=operator.pow](args = (%add_1, 2), kwargs = {})
+    return (add, add_1, add_2, pow_1, 5)""",
+        )
+
+    def test_materialize_symints_constant_symint(self):
+        """A SymInt whose expression has folded to a constant is unwrapped
+        to a plain ``int`` rather than emitting any FX nodes."""
+        gm = self._capture_gm(lambda x: x + 1, torch.randn(8, 4))
+        tensor_placeholder = self._find_placeholder(gm, torch.Tensor)
+        h = tensor_placeholder.meta["example_value"].shape[0]
+        self.assertIsInstance(h, torch.SymInt)
+
+        const = h - h  # = 0, constant SymInt
+        result = gm.graph.materialize_symints([const])
+        self.assertEqual(result, [0])
+        self.assertIsInstance(result[0], int)
+
+    def test_materialize_symints_missing_symbol_rejects(self):
+        """Materializing a SymInt whose symbol has no producer in the graph
+        raises ``AssertionError`` rather than producing a dangling node."""
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+        # Manufacture a SymInt with a non-constant symbol (no graph needed).
+        shape_env = ShapeEnv()
+        h = shape_env.create_unbacked_symint()
+        self.assertIsInstance(h, torch.SymInt)
+
+        # Empty graph has no producer for `h`'s symbol → must reject.
+        empty_graph = torch.fx.Graph()
+        with self.assertRaisesRegex(AssertionError, "no producer for"):
+            empty_graph.materialize_symints([h])
+
+    @unittest.skipIf(TEST_WITH_CROSSREF, "expectedInline graph differs under TorchFunctionMode")
+    def test_materialize_symints_symint_placeholder(self):
+        """When the symbol is produced by a top-level SymInt placeholder, the
+        placeholder itself is used as the symbol's producer — no
+        `sym_size.int` node is emitted."""
+        gm = self._capture_gm(lambda n: torch.zeros(n + 1), 8)
+        sym_placeholder = self._find_placeholder(gm, torch.SymInt)
+        s = sym_placeholder.meta["example_value"]
+        self.assertIsInstance(s, torch.SymInt)
+
+        output_node = next(n for n in gm.graph.nodes if n.op == "output")
+        with gm.graph.inserting_before(output_node):
+            result = gm.graph.materialize_symints([s + 2, s * 3])
+        output_node.args = (output_node.args[0] + tuple(result),)
+
+        self.assertEqual(len(result), 2)
+        for got in result:
+            self.assertIsInstance(got, torch.fx.Node)
+
+        # The new `add_1` and `mul` reference `%l_n_` (the SymInt placeholder)
+        # directly — no `aten.sym_size.int` node was emitted to recover `s`.
+        self.assertExpectedInline(
+            str(gm.graph).strip(),
+            """\
+graph():
+    %l_n_ : torch.SymInt [num_users=3] = placeholder[target=L_n_]
+    %add : [num_users=1] = call_function[target=operator.add](args = (%l_n_, 1), kwargs = {})
+    %zeros : [num_users=1] = call_function[target=torch.zeros](args = (%add,), kwargs = {})
+    %add_1 : [num_users=1] = call_function[target=operator.add](args = (2, %l_n_), kwargs = {})
+    %mul : [num_users=1] = call_function[target=operator.mul](args = (3, %l_n_), kwargs = {})
+    return (zeros, add_1, mul)""",
+        )
+
+    def test_materialize_symints_unbacked_via_unbacked_bindings(self):
+        """When an unbacked SymInt's producer is described by
+        ``node.meta['unbacked_bindings']`` with a non-trivial keypath (e.g.
+        ``nonzero()`` → ``.size(0)``), ``materialize_symints`` follows the
+        keypath to emit the right accessor (``aten.sym_size.int``)."""
+        from torch.fx.experimental.proxy_tensor import make_fx
+
+        def f(x):
+            return torch.nonzero(x)
+
+        gm = make_fx(f, tracing_mode="symbolic")(torch.randn(10))
+        nonzero_node = next(
+            n
+            for n in gm.graph.nodes
+            if n.target == torch.ops.aten.nonzero.default
+        )
+        bindings = nonzero_node.meta["unbacked_bindings"]
+        self.assertEqual(len(bindings), 1)
+        u = next(iter(bindings))
+        # u is the unbacked SymInt for nonzero's first output dim.
+        u_symint = nonzero_node.meta["val"].shape[0]
+        self.assertIsInstance(u_symint, torch.SymInt)
+        self.assertEqual(u_symint.node._expr, u)
+
+        result = gm.graph.materialize_symints([u_symint + 5])
+        self.assertEqual(len(result), 1)
+        self.assertIsInstance(result[0], torch.fx.Node)
+
+        # The keypath `(CallMethodKey("size"), SequenceKey(0))` is traversed,
+        # emitting `aten.sym_size.int(%nonzero, 0)` as the producer.
+        sym_size_nodes = [
+            n
+            for n in gm.graph.nodes
+            if n.target == torch.ops.aten.sym_size.int
+        ]
+        self.assertEqual(len(sym_size_nodes), 1)
+        self.assertIs(sym_size_nodes[0].args[0], nonzero_node)
+        self.assertEqual(sym_size_nodes[0].args[1], 0)
+
+    def test_materialize_symints_unbacked_via_divide_by_key(self):
+        """When an unbacked-binding keypath ends in ``DivideByKey(s_backed)``,
+        ``materialize_symints`` emits ``producer // s_backed_node`` -- where
+        ``s_backed_node`` is the lowered backed shape symbol, not a raw SymInt.
+        """
+        from torch.fx.experimental.proxy_tensor import make_fx
+        from torch.fx.experimental.symbolic_shapes import DivideByKey
+
+        # Trace a graph that has a tensor placeholder + nonzero producer for
+        # an unbacked symbol. We then synthetically rewrite the binding so
+        # the keypath includes a ``DivideByKey(s_backed)`` component, where
+        # ``s_backed`` is a backed shape symbol of the input tensor.
+        def f(x, y):
+            return torch.nonzero(y)
+
+        gm = make_fx(f, tracing_mode="symbolic")(
+            torch.randn(8, 4), torch.randn(10)
+        )
+        nonzero_node = next(
+            n
+            for n in gm.graph.nodes
+            if n.target == torch.ops.aten.nonzero.default
+        )
+        tensor_ph = next(
+            n
+            for n in gm.graph.nodes
+            if n.op == "placeholder"
+            and isinstance(n.meta.get("val"), torch.Tensor)
+            and n.meta["val"].dim() == 2
+        )
+        s_backed_symint = tensor_ph.meta["val"].shape[0]
+        self.assertIsInstance(s_backed_symint, torch.SymInt)
+
+        # Splice DivideByKey(s_backed) onto the existing keypath. The
+        # synthetic semantic: u = nonzero.size(0) // s_backed.
+        u, keypath = next(iter(nonzero_node.meta["unbacked_bindings"].items()))
+        nonzero_node.meta["unbacked_bindings"] = {
+            u: keypath + (DivideByKey(s_backed_symint),)
+        }
+        u_symint = nonzero_node.meta["val"].shape[0]
+
+        output_node = next(n for n in gm.graph.nodes if n.op == "output")
+        with gm.graph.inserting_before(output_node):
+            result = gm.graph.materialize_symints([u_symint + 1])
+        output_node.args = ((output_node.args[0],) + tuple(result),)
+
+        self.assertEqual(len(result), 1)
+        self.assertIsInstance(result[0], torch.fx.Node)
+
+        # A floordiv node was emitted whose divisor is the lowered backed
+        # shape symbol (a ``sym_size.int(%tensor_ph, 0)`` node) -- not a raw
+        # SymInt object.
+        self.assertExpectedInline(
+            str(gm.graph).strip(),
+            """\
+graph():
+    %x_1 : [num_users=1] = placeholder[target=x_1]
+    %y_1 : [num_users=1] = placeholder[target=y_1]
+    %nonzero : [num_users=2] = call_function[target=torch.ops.aten.nonzero.default](args = (%y_1,), kwargs = {})
+    %sym_size_int : [num_users=1] = call_function[target=torch.ops.aten.sym_size.int](args = (%x_1, 0), kwargs = {})
+    %sym_size_int_1 : [num_users=1] = call_function[target=torch.ops.aten.sym_size.int](args = (%nonzero, 0), kwargs = {})
+    %floordiv : [num_users=1] = call_function[target=operator.floordiv](args = (%sym_size_int_1, %sym_size_int), kwargs = {})
+    %add : [num_users=1] = call_function[target=operator.add](args = (1, %floordiv), kwargs = {})
+    return (nonzero, add)""",
+        )
+
+        floordiv_nodes = [
+            n for n in gm.graph.nodes if n.target is operator.floordiv
+        ]
+        self.assertEqual(len(floordiv_nodes), 1)
+        divisor_arg = floordiv_nodes[0].args[1]
+        self.assertIsInstance(divisor_arg, torch.fx.Node)
+        self.assertEqual(divisor_arg.target, torch.ops.aten.sym_size.int)
+        self.assertIs(divisor_arg.args[0], tensor_ph)
 
 def run_getitem_target():
     from torch.fx._symbolic_trace import _wrapped_methods_to_patch
@@ -4187,7 +5028,12 @@ def run_getitem_target():
 
 class TestOperatorSignatures(JitTestCase):
     def setUp(self):
-        # Checking for mutable operations whil tracing is feature flagged
+        # Don't call super().setUp() — JitTestCase.setUp installs JIT emit
+        # hooks that cause segfaults during process cleanup. Record state
+        # baselines that tearDown checks for.
+        self._prev_torch_function_mode_stack_len = torch._C._len_torch_function_stack()
+        self._prev_torch_function_state = torch._C._get_torch_function_state()
+        # Checking for mutable operations while tracing is feature flagged
         # Enable it in testing but not by default
         self.orig_tracer_mutable_flag = (
             torch.fx.proxy.TracerBase.check_mutable_operations
@@ -4230,7 +5076,7 @@ class TestFXAPIBackwardCompatibility(JitTestCase):
         super().setUp()
         self.maxDiff = None
 
-        # Checking for mutable operations whil tracing is feature flagged
+        # Checking for mutable operations while tracing is feature flagged
         # Enable it in testing but not by default
         self.orig_tracer_mutable_flag = (
             torch.fx.proxy.TracerBase.check_mutable_operations
@@ -4355,6 +5201,11 @@ class TestFXAPIBackwardCompatibility(JitTestCase):
 
         # Forward ref
         if isinstance(t, str):
+            # Normalize "X | None" string annotations to Optional format
+            if t.endswith(" | None"):
+                inner = t[: -len(" | None")]
+                result = f"Optional[{inner}]"
+                return result if recursive else f"'{result}'"
             if recursive:
                 return t
             else:
@@ -4394,7 +5245,7 @@ class TestFXAPIBackwardCompatibility(JitTestCase):
 
         if origin in {tuple, tuple}:
             return f"Tuple{contained_type_str}"
-        if origin in {typing.Union}:
+        if origin == typing.Union or isinstance(t, types.UnionType):
             # Annoying hack to detect Optional
             if len(contained) == 2 and (contained[0] is type(None)) ^ (
                 contained[1] is type(None)
@@ -4414,7 +5265,15 @@ class TestFXAPIBackwardCompatibility(JitTestCase):
             if len(contained) > 0 and contained[0] is not Ellipsis:
                 return f'Callable[[{", ".join(contained_type_annots[:-1])}], {contained_type_annots[-1]}]'
             else:
-                return f"Callable{contained_type_str}"
+                return f'Callable{contained_type_str}'
+
+        if t is ArgumentT:
+            # ArgumentT is a TypeVar bound to torch.fx.node.Argument
+            return f'torch.fx.node.Argument{contained_type_str}'
+
+        raise RuntimeError(f'Unrecognized type {t} used in BC-compatible type signature {sig_str}.'
+                           f'Please add support for this type and confirm with the '
+                           f'FX team that your signature change is valid.')
 
         raise RuntimeError(
             f"Unrecognized type {t} used in BC-compatible type signature {sig_str}."
@@ -4516,7 +5375,7 @@ class TestFXAPIBackwardCompatibility(JitTestCase):
         check_symbols_have_bc_designation(torch.fx.passes, set())
 
         non_back_compat_strs = [
-            torch.typename(obj) for obj in non_back_compat_objects.keys()
+            torch.typename(obj) for obj in non_back_compat_objects
         ]
         # Only want objects in torch.fx
         non_back_compat_strs = [
@@ -4553,7 +5412,7 @@ class TestFXAPIBackwardCompatibility(JitTestCase):
         self.assertEqual(len(gm.graph.nodes), 3)
         found = False
         for node in gm.graph.nodes:
-            if node.op == "call_function" and node.target == side_effect_func:
+            if node.op == "call_function" and node.target is side_effect_func:
                 found = True
         self.assertTrue(found)
 
@@ -4578,7 +5437,7 @@ class TestFXAPIBackwardCompatibility(JitTestCase):
 class TestFunctionalTracing(JitTestCase):
     def setUp(self):
         super().setUp()
-        # Checking for mutable operations whil tracing is feature flagged
+        # Checking for mutable operations while tracing is feature flagged
         # Enable it in testing but not by default
         self.orig_tracer_mutable_flag = (
             torch.fx.proxy.TracerBase.check_mutable_operations
@@ -4644,7 +5503,6 @@ class TestFunctionalTracing(JitTestCase):
         "linear": BUILT_IN_FUNC,
         "logsigmoid": BUILT_IN_FUNC,
         "one_hot": BUILT_IN_FUNC,
-        "pad": ARG_TYPE_MISMATCH,
         "pairwise_distance": BUILT_IN_FUNC,
         "pdist": BUILT_IN_FUNC,
         "pixel_shuffle": BUILT_IN_FUNC,
@@ -4670,6 +5528,7 @@ class TestFunctionalTracing(JitTestCase):
         "max_pool1d": PROXY_ITERABLE,
         "max_pool2d": PROXY_ITERABLE,
         "max_pool3d": PROXY_ITERABLE,
+        "max_pool3d_with_indices": CONTROL_FLOW,
         "lp_pool2d": PROXY_ITERATED,
         "lp_pool3d": PROXY_ITERATED,
         "max_unpool1d": PROXY_ITERATED,
@@ -4677,12 +5536,6 @@ class TestFunctionalTracing(JitTestCase):
         "max_unpool3d": PROXY_ITERATED,
         "fold": PROXY_ITERATED,
         "unfold": PROXY_ITERATED,
-        "adaptive_max_pool1d_with_indices": ARG_TYPE_MISMATCH,
-        "fractional_max_pool2d_with_indices": ARG_TYPE_MISMATCH,
-        "fractional_max_pool3d_with_indices": ARG_TYPE_MISMATCH,
-        "layer_norm": ARG_TYPE_MISMATCH,
-        "rms_norm": ARG_TYPE_MISMATCH,
-        "lp_pool1d": ARG_TYPE_MISMATCH,
         "affine_grid": CONTROL_FLOW,
         "alpha_dropout": CONTROL_FLOW,
         "batch_norm": CONTROL_FLOW,
@@ -4691,6 +5544,7 @@ class TestFunctionalTracing(JitTestCase):
         "celu": CONTROL_FLOW,
         "cosine_embedding_loss": CONTROL_FLOW,
         "cross_entropy": CONTROL_FLOW,
+        "linear_cross_entropy": CONTROL_FLOW,
         "ctc_loss": CONTROL_FLOW,
         "dropout": CONTROL_FLOW,
         "dropout1d": CONTROL_FLOW,
@@ -4716,9 +5570,6 @@ class TestFunctionalTracing(JitTestCase):
         "leaky_relu": CONTROL_FLOW,
         "local_response_norm": CONTROL_FLOW,
         "margin_ranking_loss": CONTROL_FLOW,
-        "max_pool1d_with_indices": ARG_TYPE_MISMATCH,
-        "max_pool2d_with_indices": ARG_TYPE_MISMATCH,
-        "max_pool3d_with_indices": ARG_TYPE_MISMATCH,
         "mse_loss": CONTROL_FLOW,
         "multi_head_attention_forward": CONTROL_FLOW,
         "multi_margin_loss": CONTROL_FLOW,
@@ -4813,7 +5664,6 @@ class TestFunctionalTracing(JitTestCase):
         def functional_test(self):
             if (
                 func_name in self.UNTRACEABLE_FUNCTIONALS_PY38
-                and sys.version_info >= (3, 8)
                 and sys.version_info < (3, 12)
             ):
                 exc, err = self.UNTRACEABLE_FUNCTIONALS_PY38[func_name]
@@ -4841,13 +5691,13 @@ class TestFunctionalTracing(JitTestCase):
         def no(*args, **kwargs):
             return False
 
-        for name in cls.TO_PATCH.keys():
+        for name in cls.TO_PATCH:
             cls.TO_PATCH[name] = getattr(torch.nn.functional, name)
             setattr(torch.nn.functional, name, no)
 
     @classmethod
     def tearDownClass(cls):
-        for name in cls.TO_PATCH.keys():
+        for name in cls.TO_PATCH:
             setattr(torch.nn.functional, name, cls.TO_PATCH[name])
 
 
@@ -4861,6 +5711,11 @@ instantiate_device_type_tests(TestOperatorSignatures, globals())
 @skipIfNoTorchVision
 class TestVisionTracing(JitTestCase):
     def setUp(self):
+        # Don't call super().setUp() — JitTestCase.setUp installs JIT emit
+        # hooks that cause segfaults during process cleanup. Record state
+        # baselines that tearDown checks for.
+        self._prev_torch_function_mode_stack_len = torch._C._len_torch_function_stack()
+        self._prev_torch_function_state = torch._C._get_torch_function_state()
         # Checking for mutable operations while tracing is feature flagged
         # Enable it in testing but not by default
         self.orig_tracer_mutable_flag = (
@@ -4946,11 +5801,14 @@ class TestVisionTracing(JitTestCase):
             test_name = "test_torchvision_models_" + k
             x = (
                 torch.rand(1, 3, 299, 299)
-                if k in ["inception_v3"]
+                if k == "inception_v3"
                 else torch.rand(1, 3, 224, 224)
             )
             kwargs = dict(num_classes=50)
             model_test = cls.generate_test_fn(k, x, kwargs)
+            model_test = unittest.skipIf(
+                TEST_WITH_ROCM, "Skipped on ROCm"
+            )(model_test)
             setattr(cls, test_name, model_test)
 
     @classmethod

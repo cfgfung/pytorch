@@ -1341,6 +1341,8 @@ def sample_inputs_addmv(op_info, device, dtype, requires_grad, **kwargs):
 
 def sample_inputs_addbmm(op_info, device, dtype, requires_grad, **kwargs):
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
+    beta_f = 0.5 if dtype.is_floating_point or dtype.is_complex else 2
+    alpha_f = 1.2 if dtype.is_floating_point or dtype.is_complex else 1
 
     # input_shape, batch1_shape, batch2_shape, beta_val, alpha_val, is_broadcasting
     test_cases = [((S, M), (S, S, S), (S, S, M), 1, 1, False),
@@ -1349,6 +1351,9 @@ def sample_inputs_addbmm(op_info, device, dtype, requires_grad, **kwargs):
                   ((1,), (S, S, S), (S, S, M), 0.6, 0.2, True),
                   ((), (S, S, S), (S, S, M), 1, 1, True),
                   ((), (S, S, S), (S, S, M), 0.6, 0.2, True),
+                  ((0, M), (S, 0, S), (S, S, M), 1, 1, False),
+                  ((S, M), (S, S, 0), (S, 0, M), beta_f, alpha_f, False),
+                  ((S, M), (S, S, 0), (S, 0, M), 0, 1, False),
                   ]
 
     for input_shape, batch1_shape, batch2_shape, beta, alpha, is_broadcasting in test_cases:
@@ -1436,6 +1441,7 @@ def sample_inputs_baddbmm(op_info, device, dtype, requires_grad, **kwargs):
                   ((1,), (S, S, S), (S, S, M), 0.6, 0.2, True),
                   ((), (S, S, S), (S, S, M), 1, 1, True),
                   ((), (S, S, S), (S, S, M), 0.6, 0.2, True),
+                  ((), (0, S, S), (0, S, M), 1, 1, True),  # empty batch, see #188765
                   ]
     make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad, low=None, high=None)
     for (input_shape, batch1_shape, batch2_shape, alpha, beta, broadcasts_input) in test_cases:
@@ -5427,7 +5433,10 @@ def sample_inputs_cutedsl_topk(op_info, device, dtype, requires_grad, **kwargs):
         _REGISTER_N_RANGE,
     )
 
-    make_arg = partial(make_tensor, device=device, dtype=dtype, requires_grad=False)
+    def make_arg(shape):
+        # Generic tests compare indices exactly; tie behavior has dedicated tests.
+        values = torch.randperm(math.prod(shape), dtype=torch.int64, device=device)
+        return values.reshape(shape).to(dtype)
 
     # M=256 is >= typical GPU SM count so the cond's SM-wave gate passes.
     for K in (64, 128, 256, 512, 1024):
@@ -9517,19 +9526,21 @@ def sample_inputs_scaled_dot_product_attention(op_info, device, dtype, requires_
 
     broadcast_tuple = ((num_heads, seq_q, head_dim), (batch, num_heads, seq_kv, head_dim))
 
-    qkv_shapes = [(dim_3_q_shape, dim_3_kv_shape), (dim_4_q_shape, dim_4_kv_shape), broadcast_tuple]
     samples = []
+    qkv_shapes = [(dim_3_q_shape, dim_3_kv_shape), (dim_4_q_shape, dim_4_kv_shape), broadcast_tuple]
+    dropout_ps = [0.0, 0.5]
     gqa_options = [True, False]
     causal_options = [True, False]
-    for qkv_shape, is_causal, dropout_p, _enable_gqa in product(
-            qkv_shapes, causal_options, [0.0, 0.5], gqa_options):
+    for qkv_shape, is_causal, dropout_p, enable_gqa in product(
+            qkv_shapes, causal_options, dropout_ps, gqa_options):
         shape_q, shape_kv = qkv_shape
         samples.append(SampleInput(
             make(shape_q),
             make(shape_kv),
             make(shape_kv),
             is_causal=is_causal,
-            dropout_p=dropout_p
+            dropout_p=dropout_p,
+            enable_gqa=enable_gqa
         ))
 
     # Add non standard shapes
@@ -9555,6 +9566,39 @@ def sample_inputs_scaled_dot_product_attention(op_info, device, dtype, requires_
 
     yield from samples
 
+def sample_inputs_scaled_dot_product_flash_attention_for_cpu(op_info, device, dtype, requires_grad, **kwargs):
+    make = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
+    batch, seq_q, seq_kv, num_heads, head_dim = 4, 3, 6, 4, 8
+
+    dim_4_q_shape = (batch, num_heads, seq_q, head_dim)
+    dim_4_kv_shape = (batch, num_heads, seq_kv, head_dim)
+
+    samples = []
+    qkv_shapes = [(dim_4_q_shape, dim_4_kv_shape)]
+    dropout_ps = [0.0]
+    causal_options = [True, False]
+    for qkv_shape, is_causal, dropout_p in product(
+            qkv_shapes, causal_options, dropout_ps):
+        shape_q, shape_kv = qkv_shape
+        samples.append(SampleInput(
+            make(shape_q),
+            make(shape_kv),
+            make(shape_kv),
+            is_causal=is_causal,
+            dropout_p=dropout_p,
+        ))
+
+    # Add an attn_mask
+    samples.append(
+        SampleInput(
+            make((batch, num_heads, seq_q, head_dim)),
+            make((batch, num_heads, seq_kv, head_dim)),
+            make((batch, num_heads, seq_kv, head_dim)),
+            attn_mask=make_tensor((seq_q, seq_kv), device=device, dtype=dtype, requires_grad=False),
+            is_causal=False,
+            dropout_p=0.0)
+    )
+    yield from samples
 
 def sample_inputs_efficient_attention_forward(op_info, device, dtype, requires_grad, **kwargs):
     make = partial(make_tensor, device=device, dtype=dtype, requires_grad=requires_grad)
@@ -13728,7 +13772,15 @@ op_db: list[OpInfo] = [
            # See https://github.com/pytorch/pytorch/pull/78358
            check_batched_forward_grad=False,
            supports_out=False,
-           sample_inputs_func=sample_inputs_combinations),
+           sample_inputs_func=sample_inputs_combinations,
+           decorators=[
+               DecorateInfo(
+                   toleranceOverride({torch.float16: tol(atol=5e-4, rtol=2e-3)}),
+                   device_type='cuda',
+                   dtypes=(torch.float16,),
+                   active_if=TEST_WITH_ROCM,
+               ),
+           ]),
     OpInfo('cartesian_prod',
            op=torch.cartesian_prod,
            dtypes=all_types_and_complex_and(torch.bool, torch.float16, torch.bfloat16),
@@ -14586,6 +14638,8 @@ op_db: list[OpInfo] = [
                             'TestJit', 'test_variant_consistency_jit'),
            ],
            dtypes=floating_and_complex_types(),
+           # bfloat16 is supported on CUDA/ROCm/XPU via promotion to float32 (see SpectralOps)
+           dtypesIfCUDA=floating_and_complex_types_and(torch.bfloat16),
            dtypesIfMPS=floating_and_complex_types_and(torch.float16),
            sample_inputs_func=sample_inputs_stft,
            # Runs very slowly on slow gradcheck - alternatively reduce input sizes
@@ -17391,10 +17445,7 @@ op_db: list[OpInfo] = [
                DecorateInfo(unittest.expectedFailure, 'TestJit', 'test_variant_consistency_jit'),
                DecorateInfo(unittest.expectedFailure, 'TestInductorOpInfo', 'test_comprehensive'),
                DecorateInfo(unittest.expectedFailure, 'TestMathBits', 'test_neg_view'),
-               # Error: The operator 'aten::_upsample_bilinear2d_aa_backward.grad_input'
-               # is not currently implemented for the MPS device
-               DecorateInfo(unittest.expectedFailure, 'TestCommon', 'test_variant_consistency_eager', device_type='mps'),
-               DecorateInfo(unittest.expectedFailure, 'TestCommon', 'test_noncontiguous_samples', device_type='mps'),
+               # _upsample_bilineard2d_aa_out_mps only supports floating-point dtypes
                DecorateInfo(unittest.expectedFailure, 'TestCommon', 'test_dtypes', device_type='mps'),
            )),
     OpInfo(
@@ -18161,6 +18212,21 @@ op_db: list[OpInfo] = [
             # None Mismatch Tensor
             DecorateInfo(unittest.expectedFailure, 'TestCompositeCompliance', 'test_backward', device_type='cuda'),
         )
+    ),
+    OpInfo(
+        'torch.ops.aten._scaled_dot_product_flash_attention_for_cpu',
+        sample_inputs_func=sample_inputs_scaled_dot_product_flash_attention_for_cpu,
+        dtypes=floating_types_and(torch.float16, torch.bfloat16),
+        supports_out=False,
+        has_nondeterministic_output=False,
+        supports_autograd=True,
+        supports_gradgrad=False,
+        supports_fwgrad_bwgrad=False,
+        supports_forward_ad=False,
+        supports_scripting=False,
+        check_batched_forward_grad=False,
+        supports_cow_input_no_materialize_forward=False,
+        decorators=[onlyCPU],
     ),
     OpInfo(
         'torch.ops.aten._efficient_attention_forward',
@@ -22314,7 +22380,6 @@ op_db: list[OpInfo] = [
                DecorateInfo(unittest.expectedFailure, 'TestCommon', 'test_out'),
                DecorateInfo(unittest.expectedFailure, 'TestCommon', 'test_out_warning'),
                DecorateInfo(unittest.expectedFailure, 'TestDTensorOps', 'test_dtensor_op_db'),
-               DecorateInfo(unittest.expectedFailure, 'TestInductorOpInfo', 'test_comprehensive'),
                DecorateInfo(unittest.expectedFailure, 'TestVmapOperatorsOpInfo', 'test_op_has_batch_rule'),
                DecorateInfo(unittest.skip("Skipped!"), 'TestCommon', 'test_non_standard_bool_values',
                             dtypes=[torch.bool], active_if=TEST_WITH_ROCM),
@@ -24379,15 +24444,6 @@ python_ref_db = [
             DecorateInfo(unittest.expectedFailure, 'TestMathBits', 'test_neg_view'),
             DecorateInfo(unittest.expectedFailure, 'TestMathBits', 'test_conj_view'),
             DecorateInfo(unittest.expectedFailure, 'TestMathBits', 'test_neg_conj_view'),
-            # RuntimeError: value cannot be converted to type uint8_t without overflow
-            DecorateInfo(
-                unittest.expectedFailure, 'TestCommon', 'test_python_ref', device_type='mps',
-                dtypes=(torch.uint8,)
-            ),
-            DecorateInfo(
-                unittest.expectedFailure, 'TestCommon', 'test_python_ref_torch_fallback', device_type='mps',
-                dtypes=(torch.uint8,)
-            ),
         ),
     ),
     PythonRefInfo(
@@ -24429,7 +24485,7 @@ python_ref_db = [
             # AssertionError: Tensor-likes are not equal!
             DecorateInfo(
                 unittest.expectedFailure, 'TestCommon', 'test_python_ref_torch_fallback', device_type='mps',
-                dtypes=(torch.uint8, torch.int8, torch.int64, torch.int32, torch.int16, torch.bool)),
+                dtypes=(torch.uint8, torch.int8, torch.int64, torch.int32, torch.int16)),
             # ValueError: value argument of type <class 'float'> cannot be safely cast to type <class 'int'>!
             DecorateInfo(
                 unittest.expectedFailure, 'TestCommon', 'test_python_ref', device_type='mps',
@@ -24490,7 +24546,7 @@ python_ref_db = [
             # AssertionError: Tensor-likes are not equal!
             DecorateInfo(
                 unittest.expectedFailure, 'TestCommon', 'test_python_ref_torch_fallback', device_type='mps',
-                dtypes=(torch.bool, torch.int16, torch.int32, torch.int64, torch.int8, torch.uint8)
+                dtypes=(torch.int16, torch.int32, torch.int64, torch.int8, torch.uint8)
             ),
         ),
     ),

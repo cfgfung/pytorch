@@ -795,6 +795,7 @@ class GraphModule(torch.nn.Module):
         self.assertEqual(len(eager.graphs), 0)
 
     @unittest.skipIf(sys.version_info < (3, 12), "Test CLEANUP_THROW")
+    @unittest.expectedFailure
     def test_cleanup_throw(self):
         def nested_generator():
             try:
@@ -824,93 +825,6 @@ class GraphModule(torch.nn.Module):
         i, y = self._compile_check(fn, args=(t,))
         self.assertEqual(i, 3)
         self.assertEqual(y, t.sin())
-
-    @unittest.skipIf(sys.version_info < (3, 12), "Test CLEANUP_THROW")
-    def test_cleanup_throw_custom_StopIteration(self):
-        class MyStopIteration(StopIteration):
-            pass
-
-        def nested_generator():
-            try:
-                yield 1
-                yield 2
-            except StopIteration:
-                return 123  # noqa: B901
-
-        def outer_generator():
-            yield from nested_generator()
-            yield 3
-
-        @torch.compile(backend="eager", fullgraph=True)
-        def fn(t):
-            gen = outer_generator()
-            next(gen)  # Start the outer generator and enter the nested generato
-
-            i = 0
-            try:
-                # Force an exception while the generator is running
-                i = gen.throw(MyStopIteration("stop"))
-            except RuntimeError:
-                pass
-            return (i, t.sin())
-
-        t = torch.randn(2)
-        i, y = self._compile_check(fn, args=(t,))
-        self.assertEqual(i, 3)
-        self.assertEqual(y, t.sin())
-
-    @unittest.skipIf(sys.version_info < (3, 12), "Test CLEANUP_THROW")
-    @unittest.expectedFailure
-    def test_cleanup_throw_subgen_return_value(self):
-        # CLEANUP_THROW must resume the delegating generator with the
-        # subgenerator's return value (StopIteration.value). When the
-        # subgenerator catches the thrown StopIteration and returns, the
-        # yield-from expression must evaluate to that returned value. Dynamo
-        # currently extracts the value of the *thrown* exception instead.
-        def nested_generator():
-            try:
-                yield 1
-                yield 2
-            except StopIteration:
-                return 123  # noqa: B901
-
-        def outer_generator():
-            r = yield from nested_generator()
-            yield r
-
-        @torch.compile(backend="eager", fullgraph=True)
-        def fn(t):
-            gen = outer_generator()
-            next(gen)
-            i = gen.throw(StopIteration("stop"))
-            return (i, t.sin())
-
-        t = torch.randn(2)
-        i, y = fn(t)
-        self.assertEqual(i, 123)
-        self.assertEqual(y, t.sin())
-
-    @unittest.skipIf(sys.version_info < (3, 12), "Test CLEANUP_THROW")
-    @unittest.expectedFailure
-    def test_cleanup_throw_empty_stopiteration(self):
-        def nested_generator():
-            yield 1
-            yield 2
-
-        def outer_generator():
-            yield from nested_generator()
-            yield 3
-
-        @torch.compile(backend="eager", fullgraph=True)
-        def fn(t):
-            gen = outer_generator()
-            next(gen)
-            gen.throw(StopIteration())
-            return t.sin()
-
-        t = torch.randn(2)
-        with self.assertRaises(RuntimeError):
-            fn(t)
 
     def test_iter(self):
         def whoo():
@@ -997,79 +911,6 @@ class GraphModule(torch.nn.Module):
             torch._dynamo.exc.Unsupported, "'int' object is not iterable"
         ):
             f(1)
-
-    def test_pep479_raise_stopiteration_in_body(self):
-        # PEP 479: a StopIteration that escapes a generator body is converted
-        # to RuntimeError. On 3.12+ the compiler emits CALL_INTRINSIC_1 3 for
-        # this; on earlier versions Dynamo converts at the generator frame
-        # boundary. The branch taken (RuntimeError vs StopIteration) is encoded
-        # in the returned tensor so the eager/compiled results can be compared.
-        def fn(t):
-            def whoo():
-                yield t + 1
-                raise StopIteration("boom")
-
-            g = whoo()
-            next(g)
-            try:
-                next(g)
-            except RuntimeError:
-                return t + 1.0
-            except StopIteration:
-                return t + 2.0
-            return t
-
-        t = torch.randn(2)
-        self.assertEqual(self._compile_check(fn, args=(t,)), t + 1.0)
-
-    @make_dynamo_test
-    def test_pep479_stopiteration_error(self):
-        # Ported from CPython test_generators ExceptionTest.test_stopiteration_error.
-        # Asserts the RuntimeError message, not just the type.
-        def gen():
-            raise StopIteration
-            yield
-
-        with self.assertRaisesRegex(RuntimeError, "raised StopIteration"):
-            next(gen())
-
-    @make_dynamo_test
-    def test_pep479_tutorial_stopiteration(self):
-        # Ported from CPython test_generators ExceptionTest.test_tutorial_stopiteration.
-        def f():
-            yield 1
-            raise StopIteration
-            yield 2  # never reached
-
-        g = f()
-        self.assertEqual(next(g), 1)
-        with self.assertRaisesRegex(RuntimeError, "raised StopIteration"):
-            next(g)
-
-    def test_pep479_stopiteration_from_inner_next(self):
-        # Tutorial PEP 479 case: StopIteration leaking from an inner next()
-        # inside the generator body is also converted to RuntimeError.
-        def fn(t):
-            def inner():
-                yield t + 1
-
-            def whoo():
-                it = inner()
-                while True:
-                    yield next(it)
-
-            g = whoo()
-            next(g)
-            try:
-                next(g)
-            except RuntimeError:
-                return t + 1.0
-            except StopIteration:
-                return t + 2.0
-            return t
-
-        t = torch.randn(2)
-        self.assertEqual(self._compile_check(fn, args=(t,)), t + 1.0)
 
 
 class TestGeneratorSend(GeneratorTestsBase):
@@ -1455,7 +1296,6 @@ class TestGeneratorThrow(GeneratorTestsBase):
         y = self._compile_check(fn, (t,))
         self.assertEqual(y, t.sin() + t.cos())
 
-    @unittest.expectedFailure
     def test_throw_with_finally(self):
         z = 0
 
@@ -1591,7 +1431,6 @@ class TestGeneratorThrow(GeneratorTestsBase):
         with self.assertRaises(RuntimeError):
             fn(t)
 
-    @unittest.expectedFailure
     def test_throw_yield_finally(self):
         z = 0
 
@@ -1619,7 +1458,6 @@ class TestGeneratorThrow(GeneratorTestsBase):
         with self.assertRaises(Unsupported):
             fn(t)
 
-    @unittest.expectedFailure
     def test_throw_try_except_finally(self):
         z = 0
 

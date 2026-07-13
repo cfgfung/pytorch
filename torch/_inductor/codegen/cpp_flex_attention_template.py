@@ -10,7 +10,7 @@ import torch
 import torch.utils
 
 from ...utils._ordered_set import OrderedSet
-from .. import ir
+from .. import config, ir
 from ..ir import TensorBox
 from ..select_algorithm import DataProcessorTemplateWrapper
 from ..utils import parallel_num_threads
@@ -399,6 +399,41 @@ FLEX_ATTENTION_TEMPLATE = r"""
     });
   }
   // Attention loop below
+{%- if enable_smt_pairing %}
+  // SMT sibling-adjacent scheduling: logical threads 2p and 2p+1 are treated as
+  // the two SMT siblings of one physical core and handed adjacent q-blocks of
+  // the same (batch, head). They stream the same K/V, keeping it hot in the
+  // shared L1D/L2, and one sibling's GEMM overlaps the other's softmax on the
+  // disjoint AMX/AVX units. Work-items are output-disjoint so no sync is needed.
+  // Falls back to a plain contiguous split when the thread count is odd.
+  int64_t total_qblocks = batchSize * num_head * qSlice;
+  bool smt_pairing = (num_thread % 2 == 0);
+  at::parallel_for(0, num_thread, 1, [&](int64_t tbegin, int64_t tend) {
+    for (int64_t tid = tbegin; tid < tend; ++tid) {
+      int64_t pair_id = smt_pairing ? tid / 2 : tid;
+      int64_t role = smt_pairing ? (tid & 1) : 0;
+      int64_t nchunks = smt_pairing ? num_thread / 2 : num_thread;
+      int64_t chunk = (total_qblocks + nchunks - 1) / nchunks;
+      int64_t z_begin = pair_id * chunk + role;
+      int64_t z_end = std::min(pair_id * chunk + chunk, total_qblocks);
+      int64_t z_step = smt_pairing ? 2 : 1;
+      accum_t* buf_ptr = buf_data + tid * _size_per_thread;
+      accum_t* qk_data = buf_ptr;
+      accum_t* qk_max_data = qk_data + qSplitSize * kvSplitSize;
+      accum_t* qk_sum_data = qk_max_data + qSplitSize;
+      accum_t* dst_data = qk_sum_data + qSplitSize;
+      scalar_t *qk_reduced_data =
+          is_reduced_type
+              ? buf_reduced_data + tid * qSplitSize * ekvSplitSize
+              : nullptr;
+      scalar_t* query_t_padding_ptr = (!headSize_even && need_pack)
+              ? query_padding_ptr + tid * qSplitSize * eheadSize
+              : nullptr;
+      for (int64_t z = z_begin; z < z_end; z += z_step) {
+        int64_t k = z % qSlice;
+        int64_t j = (z / qSlice) % num_head;
+        int64_t i = (z / qSlice) / num_head;
+{%- else %}
   at::parallel_for(0, batchSize * num_head * qSlice, 1, [&](int64_t begin, int64_t end) {
     int64_t i = 0, j = 0, k = 0;
     at::native::data_index_init(begin, i, batchSize, j, num_head, k, qSlice);
@@ -417,6 +452,7 @@ FLEX_ATTENTION_TEMPLATE = r"""
             : nullptr;
 
     for ([[maybe_unused]] auto z : c10::irange(begin, end)) {
+{%- endif %}
       auto i_kvi = is_broadcast_bs_kvi ? i/bs_shards_kvi : i;
       auto j_kvi = is_broadcast_head_kvi ? j/gqa_shards_kvi : j;
       auto kv_logical_num_data = kv_num_blocks_data + i_kvi * num_kviStrideB +
@@ -497,7 +533,7 @@ FLEX_ATTENTION_TEMPLATE = r"""
               cur_kvSplitSize);
 
         } else {
-          at::native::cpublas::brgemm(
+          at::native::cpublas::is(
               cur_qSplitSize,
               cur_kvSplitSize,
               eheadSize,
@@ -676,6 +712,12 @@ FLEX_ATTENTION_TEMPLATE = r"""
             headSize_v);
       }
 
+{%- if enable_smt_pairing %}
+      }
+    }
+    at::native::cpublas::brgemm_release(need_pack);
+  });
+{%- else %}
       // Move to the next query
       at::native::data_index_step(i, batchSize, j, num_head, k, qSlice);
     }
@@ -683,6 +725,7 @@ FLEX_ATTENTION_TEMPLATE = r"""
     at::native::cpublas::brgemm_release(need_pack);
 
   });
+{%- endif %}
 }
 """
 
@@ -1439,6 +1482,7 @@ class CppFlexAttentionTemplate(CppTemplate):
             score_buf_idx=self.score_buf_idx,
             mask_buf_idx=self.mask_buf_idx,
             partition_size=self.partition_size,
+            enable_smt_pairing=config.cpp.flex_attention_smt_pairing,
         )
         with contextlib.ExitStack() as stack:
             for buf in self.fake_buffers:

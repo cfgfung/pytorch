@@ -1719,6 +1719,17 @@ class cpp:
     # performance degradation.
     dynamic_threads = os.environ.get("TORCHINDUCTOR_CPP_DYNAMIC_THREADS", "0") == "1"
 
+    # Experimental: in the CPU FlexAttention prefill kernel, schedule SMT
+    # sibling threads (logical threads 2p and 2p+1) onto adjacent q-blocks of
+    # the same (batch, head) so the shared K/V stays hot in L1D/L2 and one
+    # sibling's GEMM overlaps the other's softmax on the disjoint AMX/AVX units.
+    # Requires compact thread affinity (e.g. OMP_PROC_BIND=close,
+    # OMP_PLACES=threads) and an even thread count; otherwise it silently falls
+    # back to the plain contiguous per-thread split.
+    flex_attention_smt_pairing = (
+        os.environ.get("TORCHINDUCTOR_CPP_FLEX_ATTENTION_SMT_PAIRING", "0") == "1"
+    )
+
     simdlen: int | None = None
     min_chunk_size = int(os.environ.get("TORCHINDUCTOR_CPP_MIN_CHUNK_SIZE", "512"))
 

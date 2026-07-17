@@ -199,6 +199,34 @@ MICRO_GEMM_TEMPLATE = r"""
 GEMM_DEFINE
 """
 
+# Wrapper around the CppMicroGemmAMX entry that accepts the same (M,N,K,lda,ldb,ldc)
+# layout as at::native::cpublas::brgemm over a single VNNI2 panel (what pack_vnni2
+# produces). It splits N into block_n(=32) columns and calls the AMX micro-gemm per
+# n-block: B += n*vnni_size (VNNI2 interleaves 2 K-rows, so column n lives at element
+# offset n*2 within a packed row), C += n. accum selects zero vs accumulate into C.
+AMX_GEMM_WRAPPER = r"""
+template <bool accum>
+inline void AMX_KERNEL_NAME_flex(
+    AMXState& amx_state,
+    const at::BFloat16* __restrict__ A,
+    const at::BFloat16* __restrict__ B,
+    float* __restrict__ C,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int64_t lda,
+    int64_t ldb,
+    int64_t ldc) {
+  constexpr int64_t block_n = 32;
+  constexpr int64_t vnni_size = 2;
+  for (int64_t n = 0; n < N; n += block_n) {
+    AMX_KERNEL_NAME<accum>(
+        amx_state, A, B + n * vnni_size, C + n,
+        M, block_n, K, lda, ldb, ldc);
+  }
+}
+"""
+
 ALLOCATE_BUFFER = r"""
   int64_t {{buffer_name}}_dtype_itemsize = c10::is_reduced_floating_point_v<{{buffer_dtype}}> ? 2 : 4;
   auto& {{buffer_name}}_allocator = *at::getCPUAllocator();
@@ -337,6 +365,22 @@ FLEX_ATTENTION_TEMPLATE = r"""
   int64_t ekvTail = need_pack && (kvTail % 2 != 0) ? kvTail + 1 : kvTail;
   int64_t kv_padding_size = (kvSize - 1) / kvSplitSize * ekvSplitSize + ekvTail;
 
+  // Use the inline AMX micro-gemm (instead of the synchronous oneDNN brgemm) for
+  // Q@K^T and P@V so the next kv-block's Q@K^T tiles are schedulable under this
+  // block's AVX-512 softmax (Intel AMX guide 11.2 SW pipelining). Gated so the
+  // WHOLE kv-loop is either all-AMX or all-brgemm -- never mixed within a thread,
+  // because oneDNN brgemm caches its tile config and skips ldtilecfg on unchanged
+  // shape, which would clobber (or be clobbered by) the AMX kernel's own config.
+  // Requirements (must hold for EVERY kv block incl. the tail, hence kvSize%32):
+  //   QK: N=cur_kvSplitSize %32==0, K=eheadSize %2==0
+  //   PV: N=headSize_v %32==0,     K=cur_ekvSplitSize %2==0
+  bool use_amx = need_pack
+      && std::is_same_v<scalar_t, at::BFloat16>
+      && (eheadSize % 2 == 0)
+      && (headSize_v % 32 == 0)
+      && (kvSplitSize % 32 == 0)
+      && (kvSize % 32 == 0);
+
   // Allocate per thread temp buf (accumulate type)
   int64_t _size_per_thread =
       /* qk (double-buffered for QK/softmax SW pipelining) */ 2 * qSplitSize * kvSplitSize +
@@ -419,6 +463,9 @@ FLEX_ATTENTION_TEMPLATE = r"""
     scalar_t* query_t_padding_ptr = (!headSize_even && need_pack)
             ? query_padding_ptr + ompIdx * qSplitSize * eheadSize
             : nullptr;
+    // Per-thread AMX tile state (owns the tile config for the inline QK/PV
+    // micro-gemms when use_amx). Released once at the end of this thread's work.
+    AMXState amx_state;
 
     for ([[maybe_unused]] auto z : c10::irange(begin, end)) {
       auto i_kvi = is_broadcast_bs_kvi ? i/bs_shards_kvi : i;
@@ -519,6 +566,26 @@ FLEX_ATTENTION_TEMPLATE = r"""
               kStrideN,
               cur_kvSplitSize);
 
+{%- if is_bf16 %}
+        } else if (use_amx) {
+          // Inline AMX Q@K^T: schedulable tiles (vs the synchronous brgemm) so the
+          // next block's QK can overlap this block's softmax. Same VNNI2 packed K
+          // and same (M,N,K,lda,ldb,ldc) as the brgemm path below.
+          {{kernel.kernel_name}}_kernel_micro_gemm_amx_flex<static_cast<bool>(false)>(
+              amx_state,
+              !headSize_even
+                  ? query_t_padding_ptr
+                  : q_data + i * qStrideB + j * qStrideH + m * qStrideM,
+              key_reorder_ptr + i_kv * num_head_k * eheadSize * kvSize +
+                  j_kv * eheadSize * kvSize + n * eheadSize,
+              qk_data,
+              cur_qSplitSize,
+              cur_kvSplitSize,
+              eheadSize,
+              headSize_even ? qStrideM : eheadSize,
+              cur_kvSplitSize,
+              cur_kvSplitSize);
+{%- endif %}
         } else {
           at::native::cpublas::brgemm(
               cur_qSplitSize,
@@ -679,6 +746,27 @@ FLEX_ATTENTION_TEMPLATE = r"""
           }
         } else {
           int64_t psize = n / kvSplitSize * ekvSplitSize;
+{%- if is_bf16 %}
+          if (use_amx) {
+            // Inline AMX P@V into dst_data. accum=(c_idx>0) is the online-softmax
+            // running accumulation; branch since accum is a compile-time template.
+            scalar_t* v_reorder = value_reorder_ptr +
+                i_kv * num_head_k * kv_padding_size * headSize_v +
+                j_kv * kv_padding_size * headSize_v + psize * headSize_v;
+            if (c_idx > 0) {
+              {{kernel.kernel_name}}_kernel_micro_gemm_amx_flex<static_cast<bool>(true)>(
+                  amx_state, qk_reduced_data, v_reorder, dst_data,
+                  cur_qSplitSize, headSize_v, cur_ekvSplitSize,
+                  cur_ekvSplitSize, headSize_v, headSize_v);
+            } else {
+              {{kernel.kernel_name}}_kernel_micro_gemm_amx_flex<static_cast<bool>(false)>(
+                  amx_state, qk_reduced_data, v_reorder, dst_data,
+                  cur_qSplitSize, headSize_v, cur_ekvSplitSize,
+                  cur_ekvSplitSize, headSize_v, headSize_v);
+            }
+          } else
+{%- endif %}
+          {
           at::native::cpublas::brgemm(
               cur_qSplitSize,
               headSize_v,
@@ -693,6 +781,7 @@ FLEX_ATTENTION_TEMPLATE = r"""
                   j_kv * kv_padding_size * headSize_v + psize * headSize_v,
               dst_data,
               need_pack);
+          }
         }
         } // end CONSUME (n_idx > 0)
       } // end software-pipelined kv-block loop
@@ -717,7 +806,11 @@ FLEX_ATTENTION_TEMPLATE = r"""
       at::native::data_index_step(i, batchSize, j, num_head, k, qSlice);
     }
 
-    at::native::cpublas::brgemm_release(need_pack);
+    if (use_amx) {
+      amx_state.release([]() { _tile_release(); });
+    } else {
+      at::native::cpublas::brgemm_release(need_pack);
+    }
 
   });
 }
@@ -1463,6 +1556,7 @@ class CppFlexAttentionTemplate(CppTemplate):
             has_full_kv_block=not self.no_full_kv_block,
             accumulate_dtype=self.accumulate_dtype,
             query_dtype=self.input_dtype,
+            is_bf16=self.input_dtype == torch.bfloat16,
             kvBlockSize=self.kv_block_size,
             qBlockSize=self.q_block_size,
             template=self,
@@ -1513,7 +1607,10 @@ class CppFlexAttentionTemplate(CppTemplate):
             CppTemplateKernel,
             parallel_num_threads,
         )
-        from torch._inductor.codegen.cpp_micro_gemm import CppMicroGemmFP32Vec
+        from torch._inductor.codegen.cpp_micro_gemm import (
+            CppMicroGemmAMX,
+            CppMicroGemmFP32Vec,
+        )
         from torch._inductor.virtualized import V
 
         micro_gemm_trans = CppMicroGemmFP32Vec(
@@ -1544,7 +1641,35 @@ class CppFlexAttentionTemplate(CppTemplate):
             kernel = CppTemplateKernel("cpp_micro_gemm", parallel_num_threads())
             code_trans = micro_gemm_trans.codegen_define(kernel)
             code = micro_gemm.codegen_define(kernel)
-        return code + code_trans
+        # AMX micro-gemm for the packed BF16 path (QK and P@V). Emitted only for
+        # BF16 so the inline tile kernel can replace the synchronous oneDNN brgemm,
+        # making the next block's Q@K^T tiles schedulable under this block's
+        # softmax (Intel AMX guide 11.2 SW pipelining). block_k=32 for BF16; B is
+        # VNNI2 (matches pack_vnni2). Skipped for FP16/FP32 (unsupported here).
+        code_amx = ""
+        if self.input_dtype == torch.bfloat16:
+            amx_name = kernel_name + "_kernel_micro_gemm_amx"
+            micro_gemm_amx = CppMicroGemmAMX(
+                amx_name,
+                self.input_dtype,
+                self.input_dtype,
+                self.accumulate_dtype,
+                self.accumulate_dtype,
+                GemmBlocking(32, 32, 32),
+                1,
+            )
+            with V.set_graph_handler(V.graph):
+                kernel = CppTemplateKernel("cpp_micro_gemm", parallel_num_threads())
+                code_amx = micro_gemm_amx.codegen_define(kernel)
+            # Wrapper so call sites pass the SAME (M, N, K, lda, ldb, ldc) as the
+            # oneDNN brgemm. flex packs B (K, V) as ONE VNNI2 panel via pack_vnni2,
+            # but CppMicroGemmAMX's built-in N-loop assumes concatenated block_n
+            # panels; driving it directly over a single panel is wrong for N>32.
+            # Instead call it once per 32-wide n-block: B advances by
+            # block_n*vnni_size (=64) elements into the panel, C by block_n, ldb
+            # stays the panel width. Verified bitwise-identical to brgemm.
+            code_amx += AMX_GEMM_WRAPPER.replace("AMX_KERNEL_NAME", amx_name)
+        return code + code_trans + code_amx
 
     def codegen_micro_gemm(self, kernel_name: str):
         micro_gemm = self.micro_gemm_define(kernel_name)

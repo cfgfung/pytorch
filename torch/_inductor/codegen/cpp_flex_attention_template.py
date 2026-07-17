@@ -139,6 +139,44 @@ inline void {{kernel_name}}_mul_scale_kernel(
   }
 }
 
+// out[r, 0:cols) = scale * q[r, 0:cols); out[r, cols:pcols) = 0.
+// Folds the per-kv-block score scale into a once-per-q-block Q pre-scale:
+// (scale*Q) @ K^T == scale*(Q @ K^T). Scale is applied in fp32 for reduced
+// types (only the store rounds to scalar_t) to match the old mul_scale
+// precision; the [cols, pcols) zero-pad also subsumes the odd-headSize pad.
+template <typename scalar_t>
+inline void {{kernel_name}}_scale_q_kernel(
+    const scalar_t* q_ptr,
+    scalar_t* out_ptr,
+    float scale,
+    int64_t rows,
+    int64_t cols,
+    int64_t pcols,
+    int64_t ldi) {
+  using Vec = at::vec::Vectorized<scalar_t>;
+  int64_t vec_size = Vec::size();
+  for (int64_t r = 0; r < rows; ++r) {
+    const scalar_t* src = q_ptr + r * ldi;
+    scalar_t* dst = out_ptr + r * pcols;
+    int64_t c = 0;
+    if constexpr (c10::is_reduced_floating_point_v<scalar_t>) {
+      auto fscale = at::vec::Vectorized<float>(scale);
+      for (; c < vec_size * (cols / vec_size); c += vec_size) {
+        auto [v0, v1] = at::vec::convert_to_float<scalar_t>(Vec::loadu(src + c));
+        at::vec::convert_from_float<scalar_t>(v0 * fscale, v1 * fscale).store(dst + c);
+      }
+      for (; c < cols; ++c) dst[c] = static_cast<scalar_t>(static_cast<float>(src[c]) * scale);
+    } else {
+      auto vscale = Vec(static_cast<scalar_t>(scale));
+      for (; c < vec_size * (cols / vec_size); c += vec_size) {
+        (Vec::loadu(src + c) * vscale).store(dst + c);
+      }
+      for (; c < cols; ++c) dst[c] = src[c] * static_cast<scalar_t>(scale);
+    }
+    for (int64_t p = cols; p < pcols; ++p) dst[p] = static_cast<scalar_t>(0);
+  }
+}
+
 """
 
 BRGEMM_PACK_FUNCTIONS = r"""
@@ -417,9 +455,10 @@ FLEX_ATTENTION_TEMPLATE = r"""
         is_reduced_type
             ? buf_reduced_data + ompIdx * qSplitSize * ekvSplitSize
             : nullptr;
-    scalar_t* query_t_padding_ptr = (!headSize_even && need_pack)
-            ? query_padding_ptr + ompIdx * qSplitSize * eheadSize
-            : nullptr;
+    // Per-thread scratch holding scale*Q for the current q-block, laid out
+    // [qSplitSize, eheadSize] (row stride eheadSize, tail cols zero-padded).
+    // Folds the score scale into Q once per q-block; see _scale_q_kernel.
+    scalar_t* scaled_q_ptr = query_padding_ptr + ompIdx * qSplitSize * eheadSize;
 
     for ([[maybe_unused]] auto z : c10::irange(begin, end)) {
       auto i_kvi = is_broadcast_bs_kvi ? i/bs_shards_kvi : i;
@@ -455,18 +494,17 @@ FLEX_ATTENTION_TEMPLATE = r"""
         {{kernel.kernel_name}}_fill_stub(qk_sum_data,
             static_cast<accum_t>(0), cur_qSplitSize);
 
-        if (!headSize_even && need_pack) {
-          // Pad query if headSize is not even
-          {{kernel.kernel_name}}_copy_value_with_pad<scalar_t>(
+        // Pre-scale Q once per q-block: (scale*Q)@K^T == scale*(Q@K^T). Removes
+        // the per-kv-block mul_scale pass over the whole score matrix. Also pads
+        // to eheadSize (tail cols zeroed), subsuming the odd-headSize query pad.
+        {{kernel.kernel_name}}_scale_q_kernel<scalar_t>(
             q_data + i * qStrideB + j * qStrideH + m * qStrideM,
-            query_t_padding_ptr,
+            scaled_q_ptr,
+            scaling_factor,
             cur_qSplitSize,
             headSize,
-            cur_qSplitSize,
             eheadSize,
-            qStrideM
-          );
-        }
+            qStrideM);
       }
 
       // Two-pass softmax. PASS 1 computes scale*q@k.T + score/mask mod for every
@@ -498,14 +536,13 @@ FLEX_ATTENTION_TEMPLATE = r"""
               k_data + i_kv * kStrideB + j_kv * kStrideH + n * kStrideN;
 
           {{kernel.kernel_name}}_kernel_micro_gemm_transpose_b<static_cast<bool>(false)>(
-              q_data + i * qStrideB + j * qStrideH +
-                  m * qStrideM,
+              scaled_q_ptr,
               k_addr,
               qk_data,
               cur_qSplitSize,
               cur_kvSplitSize,
               headSize,
-              qStrideM,
+              eheadSize,
               kStrideN,
               cur_kvSplitSize);
 
@@ -514,20 +551,16 @@ FLEX_ATTENTION_TEMPLATE = r"""
               cur_qSplitSize,
               cur_kvSplitSize,
               eheadSize,
-              headSize_even ? qStrideM : eheadSize,
+              eheadSize,
               cur_kvSplitSize,
               cur_kvSplitSize,
               false,
-              !headSize_even
-                  ? query_t_padding_ptr
-                  : q_data + i * qStrideB + j * qStrideH + m * qStrideM,
+              scaled_q_ptr,
               key_reorder_ptr + i_kv * num_head_k * eheadSize * kvSize +
                   j_kv * eheadSize * kvSize + n * eheadSize,
               qk_data,
               need_pack);
         }
-
-        {{kernel.kernel_name}}_mul_scale_kernel<accum_t>(qk_data, scaling_factor, cur_qSplitSize*cur_kvSplitSize);
 
 {%- if score_mod and mask_mod %}
         // TODO: reduce the number of calls of q_idx and kv_idx initialization

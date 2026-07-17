@@ -339,7 +339,7 @@ FLEX_ATTENTION_TEMPLATE = r"""
 
   // Allocate per thread temp buf (accumulate type)
   int64_t _size_per_thread =
-      /* qk     */ qSplitSize * kvSplitSize +
+      /* qk (double-buffered for QK/softmax SW pipelining) */ 2 * qSplitSize * kvSplitSize +
       /* qk_max */ qSplitSize +
       /* qk_sum */ qSplitSize +
       /* dst    */ qSplitSize * headSize_v;
@@ -404,8 +404,12 @@ FLEX_ATTENTION_TEMPLATE = r"""
     at::native::data_index_init(begin, i, batchSize, j, num_head, k, qSlice);
     int ompIdx = at::get_thread_num();
     accum_t* buf_ptr = buf_data + ompIdx * _size_per_thread;
-    accum_t* qk_data = buf_ptr;
-    accum_t* qk_max_data = qk_data + qSplitSize * kvSplitSize;
+    // qk scores are double-buffered (2 * qSplitSize * kvSplitSize): the next kv
+    // block's Q@K^T is computed into one half while the current block's softmax
+    // reads the other half (Intel AMX guide 11.2 SW pipelining). The loop binds a
+    // block-scoped qk_data to qk_data_base + (block % 2) * qSplitSize * kvSplitSize.
+    accum_t* qk_data_base = buf_ptr;
+    accum_t* qk_max_data = qk_data_base + 2 * qSplitSize * kvSplitSize;
     accum_t* qk_sum_data = qk_max_data + qSplitSize;
     accum_t* dst_data = qk_sum_data + qSplitSize;
     scalar_t *qk_reduced_data =
@@ -464,22 +468,41 @@ FLEX_ATTENTION_TEMPLATE = r"""
         }
       }
 
+      // Software-pipelined kv-block loop (Intel AMX guide 11.2 SW pipelining).
+      // Each iteration PRODUCES Q@K^T (+scale +score/mask mod) for block n_idx into
+      // one half of the double-buffered qk scores, then CONSUMES (softmax + P@V)
+      // block n_idx-1 from the other half. The trailing n_idx == kv_block_count
+      // iteration only consumes, draining the pipeline. Consumes run in block order
+      // so the online-softmax recurrence is unchanged; only each block's Q@K^T moves
+      // earlier (it has no dependency on the previous block's softmax/P@V, which read
+      // a disjoint scores buffer), which is what lets the AMX Q@K^T of the next block
+      // overlap the AVX-512 softmax of the current one.
+      auto i_kv = is_broadcast_bs_kv ? i/bs_shards : i;
+      auto j_kv = is_broadcast_head_kv ? j/gqa_shards : j;
 {%- if has_full_kv_block %}
-      for (int64_t n_idx = 0; n_idx < kv_indice_num + full_kv_indice_num ; n_idx += 1) {
+      int64_t kv_block_count = kv_indice_num + full_kv_indice_num;
+{%- else %}
+      int64_t kv_block_count = kv_indice_num;
+{%- endif %}
+      // Per-block metadata carried from a block's PRODUCE to its CONSUME one
+      // iteration later; double-buffered by parity to match the scores buffer.
+      int64_t pipe_n[2] = {0, 0};
+      int64_t pipe_kvSplitSize[2] = {0, 0};
+      int64_t pipe_ekvSplitSize[2] = {0, 0};
+      for (int64_t n_idx = 0; n_idx <= kv_block_count; n_idx += 1) {
+        // ---- PRODUCE: scale * q @ k.T + score/mask mod for block n_idx ----
+        if (n_idx < kv_block_count) {
+{%- if has_full_kv_block %}
         auto n = n_idx < kv_indice_num ? kv_indice_list[n_idx]*kvSplitSize : full_kv_indice_list[n_idx - kv_indice_num]*kvSplitSize;
 {%- else %}
-      for (int64_t n_idx = 0; n_idx < kv_indice_num ; n_idx += 1) {
         auto n = kv_indice_list[n_idx]*kvSplitSize;
 {%- endif %}
-
         auto cur_n = n/kvSplitSize;
         int64_t cur_kvSplitSize = std::min(kvSplitSize, kvSize - n);
         int64_t cur_ekvSplitSize = (need_pack && cur_kvSplitSize % 2 != 0) ? cur_kvSplitSize + 1 : cur_kvSplitSize;
+        accum_t* qk_data = qk_data_base + (n_idx % 2) * qSplitSize * kvSplitSize;
 
         // Calculate scale * q @ k.T
-        auto i_kv = is_broadcast_bs_kv ? i/bs_shards : i;
-        auto j_kv = is_broadcast_head_kv ? j/gqa_shards : j;
-
         if (!need_pack) {
           auto k_addr =
               k_data + i_kv * kStrideB + j_kv * kStrideH + n * kStrideN;
@@ -555,6 +578,19 @@ FLEX_ATTENTION_TEMPLATE = r"""
         }
 
 {%- endif %}
+        // Stash this PRODUCEd block's metadata for its CONSUME next iteration.
+        pipe_n[n_idx % 2] = n;
+        pipe_kvSplitSize[n_idx % 2] = cur_kvSplitSize;
+        pipe_ekvSplitSize[n_idx % 2] = cur_ekvSplitSize;
+        } // end PRODUCE (n_idx < kv_block_count)
+
+        // ---- CONSUME: softmax + Softmax(q @ k.T) @ v for block (n_idx - 1) ----
+        if (n_idx > 0) {
+        int64_t c_idx = n_idx - 1;
+        accum_t* qk_data = qk_data_base + (c_idx % 2) * qSplitSize * kvSplitSize;
+        int64_t n = pipe_n[c_idx % 2];
+        int64_t cur_kvSplitSize = pipe_kvSplitSize[c_idx % 2];
+        int64_t cur_ekvSplitSize = pipe_ekvSplitSize[c_idx % 2];
         // Update coefficients with Softmax
         accum_t tmp_max = 0, tmp_sum = 0, exp_tmp = 0;
         for (int64_t row = 0; row < cur_qSplitSize; ++row) {
@@ -585,7 +621,7 @@ FLEX_ATTENTION_TEMPLATE = r"""
             // max[row] <- max
             qk_max_data[row] = tmp_max;
             // dst <- dst * exp_tmp
-            if (n_idx > 0) {
+            if (c_idx > 0) {
               at::vec::map<accum_t>(
               [exp_tmp](Vec x) { return x * Vec(exp_tmp); },
               dst_data + row * headSize_v,
@@ -611,13 +647,13 @@ FLEX_ATTENTION_TEMPLATE = r"""
                   cur_ekvSplitSize,
                   vStrideN,
                   headSize_v,
-                  n_idx > 0,
+                  c_idx > 0,
                   {{kernel.kernel_name}}_conditional_data_ptr(qk_data, qk_reduced_data),
                   v_addr,
                   dst_data,
                   need_pack);
           } else {
-            if (n_idx > 0) {
+            if (c_idx > 0) {
               {{kernel.kernel_name}}_kernel_micro_gemm<static_cast<bool>(true)>(
                 {{kernel.kernel_name}}_conditional_data_ptr(qk_data, qk_reduced_data),
                 v_addr,
@@ -650,7 +686,7 @@ FLEX_ATTENTION_TEMPLATE = r"""
               cur_ekvSplitSize,
               headSize_v,
               headSize_v,
-              n_idx > 0,
+              c_idx > 0,
               qk_reduced_data,
               value_reorder_ptr +
                   i_kv * num_head_k * kv_padding_size * headSize_v +
@@ -658,7 +694,8 @@ FLEX_ATTENTION_TEMPLATE = r"""
               dst_data,
               need_pack);
         }
-      }
+        } // end CONSUME (n_idx > 0)
+      } // end software-pipelined kv-block loop
 
       // dst <- dst / sum[row]
       // reorder MHA output with strides

@@ -199,34 +199,6 @@ MICRO_GEMM_TEMPLATE = r"""
 GEMM_DEFINE
 """
 
-# Wrapper around the CppMicroGemmAMX entry that accepts the same (M,N,K,lda,ldb,ldc)
-# layout as at::native::cpublas::brgemm over a single VNNI2 panel (what pack_vnni2
-# produces). It splits N into block_n(=32) columns and calls the AMX micro-gemm per
-# n-block: B += n*vnni_size (VNNI2 interleaves 2 K-rows, so column n lives at element
-# offset n*2 within a packed row), C += n. accum selects zero vs accumulate into C.
-AMX_GEMM_WRAPPER = r"""
-template <bool accum>
-inline void AMX_KERNEL_NAME_flex(
-    AMXState& amx_state,
-    const at::BFloat16* __restrict__ A,
-    const at::BFloat16* __restrict__ B,
-    float* __restrict__ C,
-    int64_t M,
-    int64_t N,
-    int64_t K,
-    int64_t lda,
-    int64_t ldb,
-    int64_t ldc) {
-  constexpr int64_t block_n = 32;
-  constexpr int64_t vnni_size = 2;
-  for (int64_t n = 0; n < N; n += block_n) {
-    AMX_KERNEL_NAME<accum>(
-        amx_state, A, B + n * vnni_size, C + n,
-        M, block_n, K, lda, ldb, ldc);
-  }
-}
-"""
-
 ALLOCATE_BUFFER = r"""
   int64_t {{buffer_name}}_dtype_itemsize = c10::is_reduced_floating_point_v<{{buffer_dtype}}> ? 2 : 4;
   auto& {{buffer_name}}_allocator = *at::getCPUAllocator();
@@ -365,25 +337,12 @@ FLEX_ATTENTION_TEMPLATE = r"""
   int64_t ekvTail = need_pack && (kvTail % 2 != 0) ? kvTail + 1 : kvTail;
   int64_t kv_padding_size = (kvSize - 1) / kvSplitSize * ekvSplitSize + ekvTail;
 
-  // Use the inline AMX micro-gemm (instead of the synchronous oneDNN brgemm) for
-  // Q@K^T and P@V so the next kv-block's Q@K^T tiles are schedulable under this
-  // block's AVX-512 softmax (Intel AMX guide 11.2 SW pipelining). Gated so the
-  // WHOLE kv-loop is either all-AMX or all-brgemm -- never mixed within a thread,
-  // because oneDNN brgemm caches its tile config and skips ldtilecfg on unchanged
-  // shape, which would clobber (or be clobbered by) the AMX kernel's own config.
-  // Requirements (must hold for EVERY kv block incl. the tail, hence kvSize%32):
-  //   QK: N=cur_kvSplitSize %32==0, K=eheadSize %2==0
-  //   PV: N=headSize_v %32==0,     K=cur_ekvSplitSize %2==0
-  bool use_amx = need_pack
-      && std::is_same_v<scalar_t, at::BFloat16>
-      && (eheadSize % 2 == 0)
-      && (headSize_v % 32 == 0)
-      && (kvSplitSize % 32 == 0)
-      && (kvSize % 32 == 0);
-
   // Allocate per thread temp buf (accumulate type)
+  // Two-pass softmax: the qk scores for ALL kv-blocks of a q-block are kept live
+  // (pass 1 computes the global row-max over them; pass 2 re-reads them for exp),
+  // so the qk region holds kvSlice blocks instead of one.
   int64_t _size_per_thread =
-      /* qk (double-buffered for QK/softmax SW pipelining) */ 2 * qSplitSize * kvSplitSize +
+      /* qk     */ kvSlice * qSplitSize * kvSplitSize +
       /* qk_max */ qSplitSize +
       /* qk_sum */ qSplitSize +
       /* dst    */ qSplitSize * headSize_v;
@@ -448,12 +407,10 @@ FLEX_ATTENTION_TEMPLATE = r"""
     at::native::data_index_init(begin, i, batchSize, j, num_head, k, qSlice);
     int ompIdx = at::get_thread_num();
     accum_t* buf_ptr = buf_data + ompIdx * _size_per_thread;
-    // qk scores are double-buffered (2 * qSplitSize * kvSplitSize): the next kv
-    // block's Q@K^T is computed into one half while the current block's softmax
-    // reads the other half (Intel AMX guide 11.2 SW pipelining). The loop binds a
-    // block-scoped qk_data to qk_data_base + (block % 2) * qSplitSize * kvSplitSize.
+    // Base of the two-pass score store; block n_idx lives at
+    // qk_data_base + n_idx * qSplitSize * kvSplitSize (row stride cur_kvSplitSize).
     accum_t* qk_data_base = buf_ptr;
-    accum_t* qk_max_data = qk_data_base + 2 * qSplitSize * kvSplitSize;
+    accum_t* qk_max_data = qk_data_base + kvSlice * qSplitSize * kvSplitSize;
     accum_t* qk_sum_data = qk_max_data + qSplitSize;
     accum_t* dst_data = qk_sum_data + qSplitSize;
     scalar_t *qk_reduced_data =
@@ -463,9 +420,6 @@ FLEX_ATTENTION_TEMPLATE = r"""
     scalar_t* query_t_padding_ptr = (!headSize_even && need_pack)
             ? query_padding_ptr + ompIdx * qSplitSize * eheadSize
             : nullptr;
-    // Per-thread AMX tile state (owns the tile config for the inline QK/PV
-    // micro-gemms when use_amx). Released once at the end of this thread's work.
-    AMXState amx_state;
 
     for ([[maybe_unused]] auto z : c10::irange(begin, end)) {
       auto i_kvi = is_broadcast_bs_kvi ? i/bs_shards_kvi : i;
@@ -515,30 +469,19 @@ FLEX_ATTENTION_TEMPLATE = r"""
         }
       }
 
-      // Software-pipelined kv-block loop (Intel AMX guide 11.2 SW pipelining).
-      // Each iteration PRODUCES Q@K^T (+scale +score/mask mod) for block n_idx into
-      // one half of the double-buffered qk scores, then CONSUMES (softmax + P@V)
-      // block n_idx-1 from the other half. The trailing n_idx == kv_block_count
-      // iteration only consumes, draining the pipeline. Consumes run in block order
-      // so the online-softmax recurrence is unchanged; only each block's Q@K^T moves
-      // earlier (it has no dependency on the previous block's softmax/P@V, which read
-      // a disjoint scores buffer), which is what lets the AMX Q@K^T of the next block
-      // overlap the AVX-512 softmax of the current one.
+      // Two-pass softmax. PASS 1 computes scale*q@k.T + score/mask mod for every
+      // kv-block into its own slot of qk_data_base, then reduces the GLOBAL per-row
+      // max across all blocks. PASS 2 re-reads each slot for exp(scores-global_max),
+      // accumulates the row sum, and does P@V. This removes the online-softmax
+      // loop-carried recurrence (running max/sum + exp(prev-max) carry + dst rescale)
+      // that serialized the QK->softmax->PV critical path.
+      int64_t total_kv_blocks = kv_indice_num{%- if has_full_kv_block %} + full_kv_indice_num{%- endif %};
+
       auto i_kv = is_broadcast_bs_kv ? i/bs_shards : i;
       auto j_kv = is_broadcast_head_kv ? j/gqa_shards : j;
-{%- if has_full_kv_block %}
-      int64_t kv_block_count = kv_indice_num + full_kv_indice_num;
-{%- else %}
-      int64_t kv_block_count = kv_indice_num;
-{%- endif %}
-      // Per-block metadata carried from a block's PRODUCE to its CONSUME one
-      // iteration later; double-buffered by parity to match the scores buffer.
-      int64_t pipe_n[2] = {0, 0};
-      int64_t pipe_kvSplitSize[2] = {0, 0};
-      int64_t pipe_ekvSplitSize[2] = {0, 0};
-      for (int64_t n_idx = 0; n_idx <= kv_block_count; n_idx += 1) {
-        // ---- PRODUCE: scale * q @ k.T + score/mask mod for block n_idx ----
-        if (n_idx < kv_block_count) {
+
+      // ---- PASS 1: Q@K^T + scale + score/mask mod + global per-row max ----
+      for (int64_t n_idx = 0; n_idx < total_kv_blocks; n_idx += 1) {
 {%- if has_full_kv_block %}
         auto n = n_idx < kv_indice_num ? kv_indice_list[n_idx]*kvSplitSize : full_kv_indice_list[n_idx - kv_indice_num]*kvSplitSize;
 {%- else %}
@@ -546,8 +489,8 @@ FLEX_ATTENTION_TEMPLATE = r"""
 {%- endif %}
         auto cur_n = n/kvSplitSize;
         int64_t cur_kvSplitSize = std::min(kvSplitSize, kvSize - n);
-        int64_t cur_ekvSplitSize = (need_pack && cur_kvSplitSize % 2 != 0) ? cur_kvSplitSize + 1 : cur_kvSplitSize;
-        accum_t* qk_data = qk_data_base + (n_idx % 2) * qSplitSize * kvSplitSize;
+
+        accum_t* qk_data = qk_data_base + n_idx * qSplitSize * kvSplitSize;
 
         // Calculate scale * q @ k.T
         if (!need_pack) {
@@ -566,26 +509,6 @@ FLEX_ATTENTION_TEMPLATE = r"""
               kStrideN,
               cur_kvSplitSize);
 
-{%- if is_bf16 %}
-        } else if (use_amx) {
-          // Inline AMX Q@K^T: schedulable tiles (vs the synchronous brgemm) so the
-          // next block's QK can overlap this block's softmax. Same VNNI2 packed K
-          // and same (M,N,K,lda,ldb,ldc) as the brgemm path below.
-          {{kernel.kernel_name}}_kernel_micro_gemm_amx_flex<static_cast<bool>(false)>(
-              amx_state,
-              !headSize_even
-                  ? query_t_padding_ptr
-                  : q_data + i * qStrideB + j * qStrideH + m * qStrideM,
-              key_reorder_ptr + i_kv * num_head_k * eheadSize * kvSize +
-                  j_kv * eheadSize * kvSize + n * eheadSize,
-              qk_data,
-              cur_qSplitSize,
-              cur_kvSplitSize,
-              eheadSize,
-              headSize_even ? qStrideM : eheadSize,
-              cur_kvSplitSize,
-              cur_kvSplitSize);
-{%- endif %}
         } else {
           at::native::cpublas::brgemm(
               cur_qSplitSize,
@@ -645,56 +568,48 @@ FLEX_ATTENTION_TEMPLATE = r"""
         }
 
 {%- endif %}
-        // Stash this PRODUCEd block's metadata for its CONSUME next iteration.
-        pipe_n[n_idx % 2] = n;
-        pipe_kvSplitSize[n_idx % 2] = cur_kvSplitSize;
-        pipe_ekvSplitSize[n_idx % 2] = cur_ekvSplitSize;
-        } // end PRODUCE (n_idx < kv_block_count)
-
-        // ---- CONSUME: softmax + Softmax(q @ k.T) @ v for block (n_idx - 1) ----
-        if (n_idx > 0) {
-        int64_t c_idx = n_idx - 1;
-        accum_t* qk_data = qk_data_base + (c_idx % 2) * qSplitSize * kvSplitSize;
-        int64_t n = pipe_n[c_idx % 2];
-        int64_t cur_kvSplitSize = pipe_kvSplitSize[c_idx % 2];
-        int64_t cur_ekvSplitSize = pipe_ekvSplitSize[c_idx % 2];
-        // Update coefficients with Softmax
-        accum_t tmp_max = 0, tmp_sum = 0, exp_tmp = 0;
+        // Global per-row max across all kv-blocks (plain max, no online carry).
         for (int64_t row = 0; row < cur_qSplitSize; ++row) {
-          // apply scaling factor and max per row in fusion
+          accum_t tmp_max = -std::numeric_limits<accum_t>::infinity();
           {{kernel.kernel_name}}_mul_reduce_max_fusion_kernel(
               qk_data + row * cur_kvSplitSize,
               static_cast<accum_t>(1),
               cur_kvSplitSize,
               qk_data + row * cur_kvSplitSize,
               tmp_max);
-          tmp_max = qk_max_data[row] > tmp_max ? qk_max_data[row] : tmp_max;
-          if (tmp_max == -std::numeric_limits<accum_t>::infinity()) {
-            // to avoid `nan = exp2f(-inf - (-inf))`
+          qk_max_data[row] = qk_max_data[row] > tmp_max ? qk_max_data[row] : tmp_max;
+        }
+      }
+
+      // ---- PASS 2: exp(scores - global_max) + row-sum + Softmax(q@k.T) @ v ----
+      for (int64_t n_idx = 0; n_idx < total_kv_blocks; n_idx += 1) {
+{%- if has_full_kv_block %}
+        auto n = n_idx < kv_indice_num ? kv_indice_list[n_idx]*kvSplitSize : full_kv_indice_list[n_idx - kv_indice_num]*kvSplitSize;
+{%- else %}
+        auto n = kv_indice_list[n_idx]*kvSplitSize;
+{%- endif %}
+        int64_t cur_kvSplitSize = std::min(kvSplitSize, kvSize - n);
+        int64_t cur_ekvSplitSize = (need_pack && cur_kvSplitSize % 2 != 0) ? cur_kvSplitSize + 1 : cur_kvSplitSize;
+
+        accum_t* qk_data = qk_data_base + n_idx * qSplitSize * kvSplitSize;
+
+        for (int64_t row = 0; row < cur_qSplitSize; ++row) {
+          accum_t tmp_sum = 0;
+          if (qk_max_data[row] == -std::numeric_limits<accum_t>::infinity()) {
+            // fully-masked row: avoid `nan = exp(-inf - (-inf))`; PV contributes 0.
             {{kernel.kernel_name}}_fill_stub(
               {{kernel.kernel_name}}_conditional_data_ptr(qk_data, qk_reduced_data) + row * cur_ekvSplitSize,
               static_cast<scalar_t>(0), cur_kvSplitSize);
           } else {
-            tmp_sum = tmp_max;
-            // qk <- exp(qk - max) and sum per row
+            // qk <- exp(qk - global_max) and block row sum
+            tmp_sum = qk_max_data[row];
             {{kernel.kernel_name}}_exp_reduce_sum_fusion_kernel(
               qk_data + row * cur_kvSplitSize, cur_kvSplitSize,
               {{kernel.kernel_name}}_conditional_data_ptr(qk_data, qk_reduced_data) + row * cur_ekvSplitSize,
               tmp_sum);
-            // exp_tmp <- exp(max[row] - max)
-            exp_tmp = std::exp(qk_max_data[row] - tmp_max);
-            // sum[row] <- sum + exp_tmp * sum[row]
-            qk_sum_data[row] = tmp_sum + exp_tmp * qk_sum_data[row];
-            // max[row] <- max
-            qk_max_data[row] = tmp_max;
-            // dst <- dst * exp_tmp
-            if (c_idx > 0) {
-              at::vec::map<accum_t>(
-              [exp_tmp](Vec x) { return x * Vec(exp_tmp); },
-              dst_data + row * headSize_v,
-              dst_data + row * headSize_v,
-              headSize_v);
-            }
+            // sum[row] <- sum + block sum. Plain accumulate: every block shares the
+            // one global max, so no exp(prev-max) carry and no dst rescale.
+            qk_sum_data[row] += tmp_sum;
           }
           if (need_pack && cur_kvSplitSize % 2 != 0) {
             // Pad: [qSplitSize, cur_kvSplitSize] -> [qSplitSize, cur_kvSplitSize + 1]
@@ -714,13 +629,13 @@ FLEX_ATTENTION_TEMPLATE = r"""
                   cur_ekvSplitSize,
                   vStrideN,
                   headSize_v,
-                  c_idx > 0,
+                  n_idx > 0,
                   {{kernel.kernel_name}}_conditional_data_ptr(qk_data, qk_reduced_data),
                   v_addr,
                   dst_data,
                   need_pack);
           } else {
-            if (c_idx > 0) {
+            if (n_idx > 0) {
               {{kernel.kernel_name}}_kernel_micro_gemm<static_cast<bool>(true)>(
                 {{kernel.kernel_name}}_conditional_data_ptr(qk_data, qk_reduced_data),
                 v_addr,
@@ -746,27 +661,6 @@ FLEX_ATTENTION_TEMPLATE = r"""
           }
         } else {
           int64_t psize = n / kvSplitSize * ekvSplitSize;
-{%- if is_bf16 %}
-          if (use_amx) {
-            // Inline AMX P@V into dst_data. accum=(c_idx>0) is the online-softmax
-            // running accumulation; branch since accum is a compile-time template.
-            scalar_t* v_reorder = value_reorder_ptr +
-                i_kv * num_head_k * kv_padding_size * headSize_v +
-                j_kv * kv_padding_size * headSize_v + psize * headSize_v;
-            if (c_idx > 0) {
-              {{kernel.kernel_name}}_kernel_micro_gemm_amx_flex<static_cast<bool>(true)>(
-                  amx_state, qk_reduced_data, v_reorder, dst_data,
-                  cur_qSplitSize, headSize_v, cur_ekvSplitSize,
-                  cur_ekvSplitSize, headSize_v, headSize_v);
-            } else {
-              {{kernel.kernel_name}}_kernel_micro_gemm_amx_flex<static_cast<bool>(false)>(
-                  amx_state, qk_reduced_data, v_reorder, dst_data,
-                  cur_qSplitSize, headSize_v, cur_ekvSplitSize,
-                  cur_ekvSplitSize, headSize_v, headSize_v);
-            }
-          } else
-{%- endif %}
-          {
           at::native::cpublas::brgemm(
               cur_qSplitSize,
               headSize_v,
@@ -774,17 +668,15 @@ FLEX_ATTENTION_TEMPLATE = r"""
               cur_ekvSplitSize,
               headSize_v,
               headSize_v,
-              c_idx > 0,
+              n_idx > 0,
               qk_reduced_data,
               value_reorder_ptr +
                   i_kv * num_head_k * kv_padding_size * headSize_v +
                   j_kv * kv_padding_size * headSize_v + psize * headSize_v,
               dst_data,
               need_pack);
-          }
         }
-        } // end CONSUME (n_idx > 0)
-      } // end software-pipelined kv-block loop
+      }
 
       // dst <- dst / sum[row]
       // reorder MHA output with strides
@@ -806,11 +698,7 @@ FLEX_ATTENTION_TEMPLATE = r"""
       at::native::data_index_step(i, batchSize, j, num_head, k, qSlice);
     }
 
-    if (use_amx) {
-      amx_state.release([]() { _tile_release(); });
-    } else {
-      at::native::cpublas::brgemm_release(need_pack);
-    }
+    at::native::cpublas::brgemm_release(need_pack);
 
   });
 }
@@ -1556,7 +1444,6 @@ class CppFlexAttentionTemplate(CppTemplate):
             has_full_kv_block=not self.no_full_kv_block,
             accumulate_dtype=self.accumulate_dtype,
             query_dtype=self.input_dtype,
-            is_bf16=self.input_dtype == torch.bfloat16,
             kvBlockSize=self.kv_block_size,
             qBlockSize=self.q_block_size,
             template=self,
@@ -1607,10 +1494,7 @@ class CppFlexAttentionTemplate(CppTemplate):
             CppTemplateKernel,
             parallel_num_threads,
         )
-        from torch._inductor.codegen.cpp_micro_gemm import (
-            CppMicroGemmAMX,
-            CppMicroGemmFP32Vec,
-        )
+        from torch._inductor.codegen.cpp_micro_gemm import CppMicroGemmFP32Vec
         from torch._inductor.virtualized import V
 
         micro_gemm_trans = CppMicroGemmFP32Vec(
@@ -1641,35 +1525,7 @@ class CppFlexAttentionTemplate(CppTemplate):
             kernel = CppTemplateKernel("cpp_micro_gemm", parallel_num_threads())
             code_trans = micro_gemm_trans.codegen_define(kernel)
             code = micro_gemm.codegen_define(kernel)
-        # AMX micro-gemm for the packed BF16 path (QK and P@V). Emitted only for
-        # BF16 so the inline tile kernel can replace the synchronous oneDNN brgemm,
-        # making the next block's Q@K^T tiles schedulable under this block's
-        # softmax (Intel AMX guide 11.2 SW pipelining). block_k=32 for BF16; B is
-        # VNNI2 (matches pack_vnni2). Skipped for FP16/FP32 (unsupported here).
-        code_amx = ""
-        if self.input_dtype == torch.bfloat16:
-            amx_name = kernel_name + "_kernel_micro_gemm_amx"
-            micro_gemm_amx = CppMicroGemmAMX(
-                amx_name,
-                self.input_dtype,
-                self.input_dtype,
-                self.accumulate_dtype,
-                self.accumulate_dtype,
-                GemmBlocking(32, 32, 32),
-                1,
-            )
-            with V.set_graph_handler(V.graph):
-                kernel = CppTemplateKernel("cpp_micro_gemm", parallel_num_threads())
-                code_amx = micro_gemm_amx.codegen_define(kernel)
-            # Wrapper so call sites pass the SAME (M, N, K, lda, ldb, ldc) as the
-            # oneDNN brgemm. flex packs B (K, V) as ONE VNNI2 panel via pack_vnni2,
-            # but CppMicroGemmAMX's built-in N-loop assumes concatenated block_n
-            # panels; driving it directly over a single panel is wrong for N>32.
-            # Instead call it once per 32-wide n-block: B advances by
-            # block_n*vnni_size (=64) elements into the panel, C by block_n, ldb
-            # stays the panel width. Verified bitwise-identical to brgemm.
-            code_amx += AMX_GEMM_WRAPPER.replace("AMX_KERNEL_NAME", amx_name)
-        return code + code_trans + code_amx
+        return code + code_trans
 
     def codegen_micro_gemm(self, kernel_name: str):
         micro_gemm = self.micro_gemm_define(kernel_name)

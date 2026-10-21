@@ -231,7 +231,7 @@ GEMM_TEMPLATE = r"""
 {%- endif %}
 {%- if use_local_acc %}
     {%- set acc_buf_name = "local_acc_buf" %}
-        {{ kernel.define_buffer(acc_buf_name, ["Mc_blocks*Mr", "Nc_blocks*Nr"], acc_buf_dtype) }}
+        {{ kernel.define_buffer(acc_buf_name, ["Mc_blocks*Mr", "Nc_blocks*Nr"], acc_buf_dtype, acc_buf_page_offset) }}
 {%- endif %}
         for (int64_t mc_block_id = 0; mc_block_id < num_Mc_blocks_per_thread; mc_block_id++) {
             {{ template.codegen_m_loop_params()|indent(12, false) }}
@@ -331,9 +331,9 @@ GEMM_TEMPLATE = r"""
                              num_Mc_blocks_per_thread_block + m_cache_block_id) *
                                 num_Nc_blocks_per_thread_block +
                             n_cache_block_id;
-                        auto {{acc_buf_name}} = local_buf_ptrs[mxn_cache_block_id * num_Kt_blocks].get();
+                        auto {{acc_buf_name}} = {{ kernel.local_buffer_data(acc_buf_name, "local_buf_ptrs[mxn_cache_block_id * num_Kt_blocks].get()") }};
                         for (int64_t other_slice = 1; other_slice < num_Kt_blocks; other_slice++) {
-                            auto other_acc = local_buf_ptrs[mxn_cache_block_id * num_Kt_blocks + other_slice].get();
+                            auto other_acc = {{ kernel.local_buffer_data(acc_buf_name, "local_buf_ptrs[mxn_cache_block_id * num_Kt_blocks + other_slice].get()") }};
                             for (int64_t m = m_offset; m < m_offset + m_size; m++) {
                                 #pragma omp simd
                                 for (int64_t n = 0; n < n_size; n++) {
@@ -1702,6 +1702,13 @@ class CppGemmTemplate(CppTemplate):
         if L2_cache_size <= 0:
             raise AssertionError(f"Expect L2_cache_size > 0 but got {L2_cache_size}")
 
+        acc_buf_page_offset = None
+        if (
+            isinstance(micro_gemm, CppMicroGemmAMX)
+            and config.cpp.gemm_acc_buf_page_offset >= 0
+        ):
+            acc_buf_page_offset = config.cpp.gemm_acc_buf_page_offset
+
         options = dict(
             X=X,
             W=W,
@@ -1730,6 +1737,7 @@ class CppGemmTemplate(CppTemplate):
             w_scale=w_scale,
             w_zp=w_zp,
             acc_buf_dtype=torch.int32 if int8_gemm else torch.float,
+            acc_buf_page_offset=acc_buf_page_offset,
             DTYPE_TO_CPP=DTYPE_TO_CPP,
             L1_cache_size=L1_cache_size,
             L2_cache_size=L2_cache_size,

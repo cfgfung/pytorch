@@ -1465,6 +1465,13 @@ void mm_get_cache_blocking(
   }
 }
 
+// First address >= p at byte `offset` of a 4 KB page; p needs 4 KB of slack.
+template <typename T>
+inline T* place_at_page_offset(T* p, uintptr_t offset) {
+  auto addr = reinterpret_cast<uintptr_t>(p);
+  return reinterpret_cast<T*>(addr + ((offset - addr) & uintptr_t(4095)));
+}
+
 struct amx_tilecfg {
   uint8_t palette_id{0};
   uint8_t start_row{0};

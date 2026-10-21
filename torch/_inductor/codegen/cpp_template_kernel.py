@@ -41,11 +41,14 @@ def wrap_with_tensorbox(node) -> ir.TensorBox:
 
 
 class CppTemplateKernel(CppKernel):
+    """Kernel used to render CPP templates; provides the codegen helpers the templates call"""
+
     def __init__(self, kernel_name, num_threads):
         super().__init__(None, num_threads)
         self.kernel_name = kernel_name
         self.render_hooks = {}
         self.local_buffers = {}
+        self.local_buffer_page_offsets: dict[str, int] = {}
 
     def render(self, template, **kwargs):
         return PartialRender(
@@ -213,16 +216,38 @@ class CppTemplateKernel(CppKernel):
         else:
             return f"#pragma unroll {unroll}"
 
-    def define_buffer(self, name, sizes: list[Any], dtype=torch.float) -> str:
-        """Define kernel local buffer"""
+    def define_buffer(
+        self, name, sizes: list[Any], dtype=torch.float, page_offset: int | None = None
+    ) -> str:
+        """Define kernel local buffer, optionally starting at byte `page_offset` of a 4 KB page"""
         sizes = parse_expr_with_index_symbols(sizes)
         buf = ir.Buffer(
             name=name, layout=ir.FixedLayout(torch.device("cpu"), dtype, sizes)
         )
         self.local_buffers[name] = buf
-        ctype = f"{DTYPE_TO_CPP[dtype]}"
-        numel = f"{cexpr_index(buf.get_numel())}"
-        return f"auto _{name} = std::make_unique<{ctype}[]>({numel}); auto {name} = _{name}.get();"
+        if page_offset is not None:
+            if not (0 <= page_offset < 4096 and page_offset % 64 == 0):
+                raise ValueError(
+                    f"expected a multiple of 64 in [0, 4096) as page offset, got {page_offset}"
+                )
+            self.local_buffer_page_offsets[name] = page_offset
+        alloc = self._allocate_local_buffer(name)
+        data = self.local_buffer_data(name, f"_{name}.get()")
+        return f"auto _{name} = {alloc}; auto {name} = {data};"
+
+    def _allocate_local_buffer(self, name) -> str:
+        buf = self.local_buffers[name]
+        numel = buf.get_numel()
+        if name in self.local_buffer_page_offsets:
+            numel += 4096 // buf.layout.dtype.itemsize
+        return f"std::make_unique<{DTYPE_TO_CPP[buf.layout.dtype]}[]>({cexpr_index(numel)})"
+
+    def local_buffer_data(self, name, owner_ptr: str) -> str:
+        """Codegen the data pointer of a local buffer from the pointer owning its allocation"""
+        offset = self.local_buffer_page_offsets.get(name)
+        if offset is None:
+            return owner_ptr
+        return f"place_at_page_offset({owner_ptr}, {offset})"
 
     def define_stack_allocated_buffer(
         self, name, sizes: list[Any], dtype=torch.float
@@ -241,10 +266,8 @@ class CppTemplateKernel(CppKernel):
         """Reinit the previously defined local buffer if it is null"""
         if name not in self.local_buffers:
             raise AssertionError(f"unknown local buffer: {name}")
-        buf = self.local_buffers[name]
-        ctype = f"{DTYPE_TO_CPP[buf.layout.dtype]}"
-        numel = f"{cexpr_index(buf.get_numel())}"
-        return f"if (_{name} == nullptr) {{ _{name} = std::make_unique<{ctype}[]>({numel}); {name} = _{name}.get(); }}"
+        data = self.local_buffer_data(name, f"_{name}.get()")
+        return f"if (_{name} == nullptr) {{ _{name} = {self._allocate_local_buffer(name)}; {name} = {data}; }}"
 
     def release_buffer(self, name):
         """Codegen the code to release the ownership of a local buffer to others"""

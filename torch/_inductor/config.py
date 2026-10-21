@@ -2034,6 +2034,15 @@ class cpp:
     # When set to 0, the number of slices is unlimited.
     gemm_max_k_slices = int(os.environ.get("TORCHINDUCTOR_CPP_GEMM_MAX_K_SLICES", "1"))
 
+    # Byte offset within a 4 KB page at which the per-thread accumulator of AMX GEMMs
+    # starts; -1 keeps the allocator's placement. Allocators such as tcmalloc hand out
+    # 4 KB accumulators as adjacent page-aligned pages, so the hardware prefetch of the
+    # next page triggered by one thread's tile loads pulls in lines of another thread's
+    # accumulator, whose tile stores then need cross-core RFOs.
+    gemm_acc_buf_page_offset = int(
+        os.environ.get("TORCHINDUCTOR_CPP_GEMM_ACC_BUF_PAGE_OFFSET", "2048")
+    )
+
     # For perf tuning and debugging purpose, configure the pre-defined cache blocking for
     # MxNxK dims respectively. The blockings are separated by comma and the unit is
     # the number of register blocks.

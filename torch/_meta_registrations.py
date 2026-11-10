@@ -3170,6 +3170,10 @@ if torch._C._has_mkldnn:
             )
         return accum
 
+    @register_meta(torch.ops.onednn.qconv2d_pointwise_.binary_tensor)
+    def meta_qconv2d_pointwise_binary_(accum, *args):
+        return accum
+
     @register_meta(torch.ops.onednn.qlinear_pointwise.default)
     @register_meta(torch.ops.onednn.qlinear_pointwise.tensor)
     def meta_qlinear_pointwise(

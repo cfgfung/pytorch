@@ -1735,6 +1735,33 @@ Tensor mm_mat2_backward(
   return maybe_multiply(mat1.t().conj().mm(grad), alpha.conj());
 }
 
+// _grouped_mm requires each operand to be row- or column-major with a leading
+// dimension that is a multiple of 16 bytes and, except on CPU, 16-byte aligned
+// (per-batch) data pointers; see check_valid_strides_and_return_transposed.
+// grad can have any layout (e.g. zero strides from the backward of sum()), so
+// copy it into a row-major layout with padded rows when it does not qualify.
+static Tensor as_grouped_mm_operand(const Tensor& grad) {
+  const auto& sizes = grad.sym_sizes();
+  const auto& strides = grad.sym_strides();
+  const auto dim = sizes.size();
+  const int64_t alignment = 16 / grad.element_size();
+  const auto aligned = [&](const c10::SymInt& s) { return s % alignment == 0; };
+  const auto major = [&](size_t unit_dim, size_t ld_dim) {
+    return strides[unit_dim] == 1 &&
+        strides[ld_dim] >= sizes[unit_dim].max(1) && aligned(strides[ld_dim]);
+  };
+  const bool aligned_ptrs = grad.is_cpu() ||
+      (aligned(grad.sym_storage_offset()) && (dim == 2 || aligned(strides[0])));
+  if ((major(dim - 1, dim - 2) || major(dim - 2, dim - 1)) && aligned_ptrs) {
+    return grad;
+  }
+  const auto ld =
+      (sizes[dim - 1].max(1) + alignment - 1) / alignment * alignment;
+  const auto padded_strides = dim == 2 ? at::SymDimVector{ld, 1}
+                                       : at::SymDimVector{sizes[1] * ld, ld, 1};
+  return grad.new_empty_strided_symint(sizes, padded_strides).copy_(grad);
+}
+
 Tensor _grouped_mm_mat1_backward(
     const Tensor& grad,
     const Tensor& mat2,
@@ -1747,6 +1774,7 @@ Tensor _grouped_mm_mat1_backward(
       grad.layout() == c10::kStrided && mat2.layout() == c10::kStrided &&
           mat1_layout == c10::kStrided,
       "only strided layout supported for grouped mm");
+  const auto grad_ = as_grouped_mm_operand(grad);
   // if input was column-major, return grad as column-order for efficiency
   if (offs.has_value() && !offs->defined()) {
     offs = std::nullopt;
@@ -1755,10 +1783,10 @@ Tensor _grouped_mm_mat1_backward(
   if (mat1_strides[mat1_dim - 2] == 1 &&
       mat1_strides[mat1_dim - 1] == mat1_sizes[mat1_dim - 2]) {
     auto grad_inp =
-        (at::_grouped_mm(mat2, grad.transpose(-2, -1), offs)).transpose(-2, -1);
+        at::_grouped_mm(mat2, grad_.transpose(-2, -1), offs).transpose(-2, -1);
     return maybe_multiply(grad_inp, alpha.conj());
   } else {
-    auto grad_inp = (at::_grouped_mm(grad, mat2.transpose(-2, -1), offs));
+    auto grad_inp = (at::_grouped_mm(grad_, mat2.transpose(-2, -1), offs));
     return maybe_multiply(grad_inp, alpha.conj());
   }
 }
@@ -1775,6 +1803,7 @@ Tensor _grouped_mm_mat2_backward(
       grad.layout() == c10::kStrided && mat1.layout() == c10::kStrided &&
           mat2_layout == c10::kStrided,
       "only strided layout supported for grouped mm");
+  const auto grad_ = as_grouped_mm_operand(grad);
   // if input was column-major, return grad as column-order for efficiency
   auto mat2_dim = mat2_sizes.size();
   if (offs.has_value() && !offs->defined()) {
@@ -1783,10 +1812,10 @@ Tensor _grouped_mm_mat2_backward(
   if (mat2_strides[mat2_dim - 2] == 1 &&
       mat2_strides[mat2_dim - 1] == mat2_sizes[mat2_dim - 2]) {
     auto grad_inp =
-        at::_grouped_mm(grad.transpose(-2, -1), mat1, offs).transpose(-2, -1);
+        at::_grouped_mm(grad_.transpose(-2, -1), mat1, offs).transpose(-2, -1);
     return maybe_multiply(grad_inp, alpha.conj());
   } else {
-    auto grad_inp = at::_grouped_mm(mat1.transpose(-2, -1), grad, offs);
+    auto grad_inp = at::_grouped_mm(mat1.transpose(-2, -1), grad_, offs);
     return maybe_multiply(grad_inp, alpha.conj());
   }
 }

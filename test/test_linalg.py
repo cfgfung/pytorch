@@ -12614,13 +12614,12 @@ class TestGroupedMM(TestCase):
             matrix = matrix[::(1 + strided)]
         return matrix if row_major else matrix.transpose(-2, -1)
 
-    def grouped_mm_helper(self, a, b, offs=None, backward=True):
+    def grouped_mm_helper(self, a, b, offs=None, backward=True, make_grad=torch.randn_like):
         a.requires_grad_(backward)
         b.requires_grad_(backward)
         out = F.grouped_mm(a, b.transpose(-2, -1), offs=offs, out_dtype=a.dtype)
         if backward:
-            # Odd output widths need padded gradients to satisfy grouped_mm alignment.
-            grad = self._make_grouped_mm_matrix(out.shape, True, out.device, out.dtype)
+            grad = make_grad(out)
             out.backward(grad)
         ends = offs.cpu().tolist() if offs is not None else [0] * a.size(0)
         # MI200 fp16 backward GEMMs round inputs to bf16 (fp16_alt_impl), but only in some rocBLAS kernels, so the
@@ -12665,6 +12664,35 @@ class TestGroupedMM(TestCase):
         b = self._make_grouped_mm_matrix(b_shape, b_row_major, device, dtype, strided)
         offs = None if offsets is None else torch.tensor(offsets, device=device, dtype=torch.int32)
         self.grouped_mm_helper(a, b, offs, backward=backward)
+
+    @skipCUDAIf(not SM80OrLater, "Grouped gemm supported only on SM80 or greater")
+    @parametrize("grad_layout", ["expanded", "strided", "dense", "column_major"])
+    @parametrize("a_shape,b_shape,offsets", [
+        subtest(((15, 48), (13, 48), [17, 30, 38, 48]), name="2d_2d"),
+        subtest(((47, 16), (4, 13, 16), [17, 30, 38, 47]), name="2d_3d"),
+        subtest(((4, 15, 16), (51, 16), [17, 30, 38, 51]), name="3d_2d"),
+        subtest(((4, 15, 16), (4, 13, 16), None), name="3d_3d"),
+    ])
+    @dtypes(torch.bfloat16, torch.float32, torch.float16)
+    @dtypesIfCUDA(torch.float32)  # unaligned cases require the CUDA float32 fallback
+    def test_grouped_mm_backward(self, device, grad_layout, a_shape, b_shape, offsets, dtype):
+        # https://github.com/pytorch/pytorch/issues/203485
+        # grouped_mm requires 16-byte aligned row- or column-major operands, but its backward must take gradients of
+        # any layout. The odd sizes leave the rows of dense and the columns of column-major gradients unaligned.
+        def make_grad(out):
+            *batch, m, n = out.shape
+            if grad_layout == "expanded":
+                return torch.randn(n, device=device, dtype=dtype).expand(out.shape)
+            if grad_layout == "strided":
+                return torch.randn(*batch, m, 2 * n, device=device, dtype=dtype)[..., ::2]
+            if grad_layout == "column_major":
+                return torch.randn(*batch, n, m, device=device, dtype=dtype).mT
+            return torch.randn_like(out)
+
+        a = self._make_grouped_mm_matrix(a_shape, True, device, dtype)
+        b = self._make_grouped_mm_matrix(b_shape, True, device, dtype)
+        offs = None if offsets is None else torch.tensor(offsets, device=device, dtype=torch.int32)
+        self.grouped_mm_helper(a, b, offs, make_grad=make_grad)
 
     # The ROCm grouped gemm backends are opt-in via env var, which CI never sets.
     @onlyCUDA

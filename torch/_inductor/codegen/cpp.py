@@ -2151,6 +2151,8 @@ class CppKernel(Kernel):
         self.num_threads = num_threads  # num_threads the kernel specialized for
         self.reduction_omp_dec: dict[tuple[str, str], str] = {}
         self.reduction_var_names: list[str] = []
+        # (acc, helper name, helper range, dtype) of each scalar welford helper
+        self.scalar_welford_helpers: list[tuple[str, str, sympy.Expr, torch.dtype]] = []
 
     def _gen_parallel_reduction_buffers(
         self,
@@ -2413,6 +2415,7 @@ class CppKernel(Kernel):
         dtype,
         num_threads=None,
         use_scalar=False,
+        array_size=None,
     ):
         num_range_thread = (
             CeilDiv(helper_range, num_threads) if num_threads else helper_range
@@ -2435,12 +2438,11 @@ class CppKernel(Kernel):
                 if hasattr(self, "_get_vec_type")
                 else DTYPE_TO_CPP[dtype]
             )
-        helper_init_line = (
-            f"{helper_type}<{h_type}, {chunk_size}> {helper_val}"
-            f"("
-            f"{num_range_thread_expr}"
-            f");"
-        )
+        helper_cls = f"{helper_type}<{h_type}, {chunk_size}>"
+        if array_size is None:
+            helper_init_line = f"{helper_cls} {helper_val}({num_range_thread_expr});"
+        else:
+            helper_init_line = f"std::vector<{helper_cls}> {helper_val}_arr({array_size}, {helper_cls}({num_range_thread_expr}));"
         if reduction_type == "sum":
             return helper_init_line
         if isinstance(num_chunks, sympy.Integer) and num_chunks <= 1:
@@ -2533,6 +2535,10 @@ class CppKernel(Kernel):
                 dtype,
                 use_scalar=True,
             )
+            if reduction_type == "welford_reduce":
+                self.scalar_welford_helpers.append(
+                    (f"{acc}", scalar_helper_val, reduction_size, dtype)
+                )
             self.stores.writeline(
                 f"{acc} = {reduction_combine(reduction_type, acc, value, scalar_helper_val)};"
             )
@@ -5001,11 +5007,22 @@ class CppKernelProxy(CppKernel):
 
             # Prefix
             if type(tail_loop_kernel) is self.kernel_cls:
-                # if tail loop kernel is a scalar kernel, we need to extend tmp_acc -> tmp_acc_arr[] to
-                # hold the temporary inner loop acc result for outer tail loop
-                tail_loop_kernel.finalize_reduction_prefix(
-                    main_loop_kernel.tiling_factor
-                )
+                # if tail loop kernel is a scalar kernel, we need to extend tmp_acc -> tmp_acc_arr[] and
+                # welford_helper -> welford_helper_arr[] to hold the temporary inner loop acc result for
+                # outer tail loop
+                tail_size = main_loop_kernel.tiling_factor
+                tail_loop_kernel.finalize_reduction_prefix(tail_size)
+                for _, helper, numel, dtype in tail_loop_kernel.scalar_welford_helpers:
+                    tail_loop_kernel.reduction_prefix.writeline(
+                        tail_loop_kernel._acc_helper_init(
+                            "welford_reduce",
+                            helper,
+                            numel,
+                            dtype,
+                            use_scalar=True,
+                            array_size=tail_size,
+                        )
+                    )
                 main_loop_kernel.finalize_reduction_prefix()
                 self.reduction_prefix.splice(
                     tail_loop_kernel.reduction_prefix
@@ -5029,19 +5046,25 @@ class CppKernelProxy(CppKernel):
                 ):
                     stack.enter_context(suffix_buf.indent())
                     if type(tail_loop_kernel) is self.kernel_cls:
-                        reduction_vars = tail_loop_kernel.reduction_var_names
-                        for name in reduction_vars:
+                        # Fold each lane's welford helper into its acc before the stores.
+                        welford_helpers = tail_loop_kernel.scalar_welford_helpers
+                        welford_fold = IndentedBuffer()
+                        for acc, helper, _, _ in welford_helpers:
+                            welford_fold.writeline(
+                                f"{acc} = welford_combine({acc}, &{helper});"
+                            )
+                        helper_names = [helper for _, helper, _, _ in welford_helpers]
+                        suffix = welford_fold + tail_loop_kernel.reduction_suffix
+                        for name in tail_loop_kernel.reduction_var_names + helper_names:
                             new_name = f"{name}_arr[{outer_loop.var}_tail - {cexpr_index(outer_loop.tiled_size)}]"
                             replace_acc_name(tail_loop_kernel.stores, name, new_name)
-                            replace_acc_name(
-                                tail_loop_kernel.reduction_suffix, name, new_name
-                            )
+                            replace_acc_name(suffix, name, new_name)
                         # If tail loop kernel is a scalar kernel, use direct sum instead of cascade_sum_combine
                         # as the reduction vars are extended: tmp_acc -> tmp_acc_arr[].
                         replace_cascade_sum_with_add(tail_loop_kernel.stores)
                         suffix_buf.splice(
                             move_code_under_inner_loop(
-                                tail_loop_kernel.reduction_suffix,
+                                suffix,
                                 outer_loop.var,
                                 f"{outer_loop.var}_tail",
                                 outer_loop.tiled_size,

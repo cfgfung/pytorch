@@ -5180,6 +5180,20 @@ class CPUReproTests(TestCase):
             code,
         )
 
+    @requires_vectorization
+    @config.patch({"cpp.enable_loop_tail_vec": False})
+    def test_vertical_reduction_scalar_tail_welford_helper(self):
+        # https://github.com/pytorch/pytorch/issues/201473
+        # Each scalar tail lane needs its own welford helper once the reduction
+        # exceeds the 4096 chunk size.
+        def fn(x):
+            return x.var(dim=0)
+
+        x = torch.randn(8193, 18) + 2
+        actual, code = run_and_get_cpp_code(torch.compile(fn), x)
+        self.assertEqual(actual, fn(x.double()).float(), rtol=1e-5, atol=1e-5)
+        self.assertIn("&scalar_welford_helper0_arr[x0_tail - ", code)
+
     def test_invalid_index_of_empty_tensor(self):
         def fn(a):
             b = a[[0]]
